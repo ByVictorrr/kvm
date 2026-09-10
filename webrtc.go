@@ -6,15 +6,20 @@ import (
 	"encoding/json"
 	"net"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/jetkvm/kvm/internal/diagnostics"
+	"github.com/jetkvm/kvm/internal/hidrpc"
+	"github.com/jetkvm/kvm/internal/logging"
+	"github.com/jetkvm/kvm/internal/playoutdelay"
+	"github.com/jetkvm/kvm/internal/sync"
+	"github.com/jetkvm/kvm/internal/usbgadget"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/gin-gonic/gin"
-	"github.com/jetkvm/kvm/internal/hidrpc"
-	"github.com/jetkvm/kvm/internal/logging"
-	"github.com/jetkvm/kvm/internal/usbgadget"
+	"github.com/pion/ice/v4"
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 	"github.com/rs/zerolog"
 )
@@ -22,6 +27,7 @@ import (
 type Session struct {
 	peerConnection           *webrtc.PeerConnection
 	VideoTrack               *webrtc.TrackLocalStaticSample
+	AudioTrack               *webrtc.TrackLocalStaticSample
 	ControlChannel           *webrtc.DataChannel
 	RPCChannel               *webrtc.DataChannel
 	HidChannel               *webrtc.DataChannel
@@ -33,10 +39,78 @@ type Session struct {
 	lastKeepAliveArrivalTime time.Time  // Track when last keep-alive packet arrived
 	lastTimerResetTime       time.Time  // Track when auto-release timer was last reset
 	keepAliveJitterLock      sync.Mutex // Protect jitter compensation timing state
-	hidQueueLock             sync.Mutex
 	hidQueue                 []chan hidQueueMessage
 
 	keysDownStateQueue chan usbgadget.KeysDownState
+	done               chan struct{}
+	closeOnce          sync.Once
+
+	codecMimeType string
+}
+
+var (
+	actionSessions      int = 0
+	activeSessionsMutex     = &sync.Mutex{}
+)
+
+func incrActiveSessions() int {
+	activeSessionsMutex.Lock()
+	defer activeSessionsMutex.Unlock()
+
+	actionSessions++
+	return actionSessions
+}
+
+func decrActiveSessions() int {
+	activeSessionsMutex.Lock()
+	defer activeSessionsMutex.Unlock()
+
+	actionSessions--
+	return actionSessions
+}
+
+func getActiveSessions() int {
+	activeSessionsMutex.Lock()
+	defer activeSessionsMutex.Unlock()
+
+	return actionSessions
+}
+
+// GetDiagnosticsInfo returns WebRTC diagnostic info for the diagnostics package.
+func (s *Session) GetDiagnosticsInfo() diagnostics.SessionInfo {
+	info := diagnostics.SessionInfo{
+		HasCurrentSession: true,
+	}
+
+	if s.peerConnection != nil {
+		pc := s.peerConnection
+		info.ICEConnectionState = pc.ICEConnectionState().String()
+		info.SignalingState = pc.SignalingState().String()
+		info.ConnectionState = pc.ConnectionState().String()
+
+		var channels []diagnostics.DataChannelInfo
+		if s.ControlChannel != nil {
+			channels = append(channels, diagnostics.DataChannelInfo{
+				Label: s.ControlChannel.Label(),
+				State: s.ControlChannel.ReadyState().String(),
+			})
+		}
+		if s.RPCChannel != nil {
+			channels = append(channels, diagnostics.DataChannelInfo{
+				Label: s.RPCChannel.Label(),
+				State: s.RPCChannel.ReadyState().String(),
+			})
+		}
+		if s.HidChannel != nil {
+			channels = append(channels, diagnostics.DataChannelInfo{
+				Label: s.HidChannel.Label(),
+				State: s.HidChannel.ReadyState().String(),
+			})
+		}
+		info.DataChannels = channels
+	}
+
+	return info
 }
 
 func (s *Session) resetKeepAliveTime() {
@@ -57,6 +131,81 @@ type SessionConfig struct {
 	IsCloud    bool
 	ws         *websocket.Conn
 	Logger     *zerolog.Logger
+	MDNSMode   string
+}
+
+// negotiateAudioCodec returns the audio MIME type to use, or "" if the browser
+// offer advertises no supported audio codec.
+func negotiateAudioCodec(offerSDP string) string {
+	upper := strings.ToUpper(offerSDP)
+	switch {
+	case strings.Contains(upper, "G722/8000"):
+		return webrtc.MimeTypeG722
+	case strings.Contains(upper, "PCMU/8000"):
+		return webrtc.MimeTypePCMU
+	}
+	return ""
+}
+
+// attachAudioTrack adds an outgoing audio track when audio is enabled, the USB
+// gadget allows audio, and the browser advertised a codec we support. No-op
+// otherwise; the SDP answer just leaves the audio m-line inactive.
+func (s *Session) attachAudioTrack(offerSDP string) error {
+	if !effectiveAudioEnabled() {
+		webrtcLogger.Debug().Msg("audio disabled by device config")
+		return nil
+	}
+	audioMime := negotiateAudioCodec(offerSDP)
+	if audioMime == "" {
+		webrtcLogger.Warn().Msg("browser offer has no supported audio codec; audio disabled")
+		return nil
+	}
+	track, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: audioMime, ClockRate: 8000}, "audio", "kvm")
+	if err != nil {
+		return err
+	}
+	sender, err := s.peerConnection.AddTrack(track)
+	if err != nil {
+		return err
+	}
+	s.AudioTrack = track
+	webrtcLogger.Info().Str("codec", audioMime).Msg("audio track enabled")
+	go drainRTCP(sender)
+	return nil
+}
+
+// drainRTCP reads and discards RTCP packets from a sender. Required for NACK
+// handling on outgoing tracks; the sender stops on connection close.
+func drainRTCP(sender *webrtc.RTPSender) {
+	buf := make([]byte, 1500)
+	for {
+		if _, _, err := sender.Read(buf); err != nil {
+			return
+		}
+	}
+}
+
+// resolveCodec picks the video codec based on user preference and browser support.
+// Always validates against the browser's SDP offer to prevent negotiation failure.
+func resolveCodec(offerSDP string) string {
+	browserSupportsH265 := strings.Contains(strings.ToUpper(offerSDP), "H265")
+
+	switch config.VideoCodecPreference {
+	case "h265":
+		if browserSupportsH265 {
+			return webrtc.MimeTypeH265
+		}
+		logger.Warn().Msg("H.265 preferred but browser does not support it, falling back to H.264")
+		return webrtc.MimeTypeH264
+	case "h264":
+		return webrtc.MimeTypeH264
+	default: // "auto" or ""
+		if browserSupportsH265 {
+			return webrtc.MimeTypeH265
+		}
+		return webrtc.MimeTypeH264
+	}
 }
 
 func (s *Session) ExchangeOffer(offerStr string) (string, error) {
@@ -69,6 +218,27 @@ func (s *Session) ExchangeOffer(offerStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	codec := resolveCodec(offer.SDP)
+	s.codecMimeType = codec
+
+	s.VideoTrack, err = webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: codec}, "video", "kvm")
+	if err != nil {
+		return "", err
+	}
+
+	rtpSender, err := s.peerConnection.AddTrack(s.VideoTrack)
+	if err != nil {
+		return "", err
+	}
+
+	go drainRTCP(rtpSender)
+
+	if err := s.attachAudioTrack(offer.SDP); err != nil {
+		return "", err
+	}
+
 	// Set the remote SessionDescription
 	if err = s.peerConnection.SetRemoteDescription(offer); err != nil {
 		return "", err
@@ -94,19 +264,48 @@ func (s *Session) ExchangeOffer(offerStr string) (string, error) {
 }
 
 func (s *Session) initQueues() {
-	s.hidQueueLock.Lock()
-	defer s.hidQueueLock.Unlock()
-
 	s.hidQueue = make([]chan hidQueueMessage, 0)
 	for i := 0; i < 4; i++ {
-		q := make(chan hidQueueMessage, 256)
-		s.hidQueue = append(s.hidQueue, q)
+		s.hidQueue = append(s.hidQueue, make(chan hidQueueMessage, 256))
 	}
 }
 
-func (s *Session) handleQueues(index int) {
-	for msg := range s.hidQueue[index] {
-		onHidMessage(msg, s)
+func (s *Session) handleHidQueue(queue <-chan hidQueueMessage) {
+	for {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
+		select {
+		case <-s.done:
+			return
+		case msg := <-queue:
+			onHidMessage(msg, s)
+		}
+	}
+}
+
+func (s *Session) enqueueHidMessage(queueIndex int, msg hidQueueMessage) bool {
+	if s == nil || s.isClosed() {
+		return false
+	}
+
+	if queueIndex >= len(s.hidQueue) || queueIndex < 0 {
+		return false
+	}
+
+	queue := s.hidQueue[queueIndex]
+	if queue == nil {
+		return false
+	}
+
+	select {
+	case queue <- msg:
+		return true
+	case <-s.done:
+		return false
 	}
 }
 
@@ -114,18 +313,34 @@ const keysDownStateQueueSize = 64
 
 func (s *Session) initKeysDownStateQueue() {
 	// serialise outbound key state reports so unreliable links can't stall input handling
-	s.keysDownStateQueue = make(chan usbgadget.KeysDownState, keysDownStateQueueSize)
-	go s.handleKeysDownStateQueue()
+	queue := make(chan usbgadget.KeysDownState, keysDownStateQueueSize)
+	s.keysDownStateQueue = queue
+	go s.handleKeysDownStateQueue(queue)
 }
 
-func (s *Session) handleKeysDownStateQueue() {
-	for state := range s.keysDownStateQueue {
-		s.reportHidRPCKeysDownState(state)
+func (s *Session) handleKeysDownStateQueue(queue <-chan usbgadget.KeysDownState) {
+	for {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
+		select {
+		case <-s.done:
+			return
+		case state := <-queue:
+			s.reportHidRPCKeysDownState(state)
+		}
 	}
 }
 
 func (s *Session) enqueueKeysDownState(state usbgadget.KeysDownState) {
-	if s == nil || s.keysDownStateQueue == nil {
+	if s == nil || s.isClosed() {
+		return
+	}
+
+	if s.keysDownStateQueue == nil {
 		return
 	}
 
@@ -134,6 +349,34 @@ func (s *Session) enqueueKeysDownState(state usbgadget.KeysDownState) {
 	default:
 		hidRPCLogger.Warn().Msg("dropping keys down state update; queue full")
 	}
+}
+
+func (s *Session) enqueueRPCMessage(msg webrtc.DataChannelMessage) bool {
+	if s == nil || s.rpcQueue == nil || s.isClosed() {
+		return false
+	}
+
+	select {
+	case s.rpcQueue <- msg:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
+func (s *Session) isClosed() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Session) close() {
+	s.closeOnce.Do(func() {
+		close(s.done)
+	})
 }
 
 func getOnHidMessageHandler(session *Session, scopedLogger *zerolog.Logger, channel string) func(msg webrtc.DataChannelMessage) {
@@ -159,6 +402,16 @@ func getOnHidMessageHandler(session *Session, scopedLogger *zerolog.Logger, chan
 
 		l.Trace().Msg("received data in HID RPC message handler")
 
+		// Cancel before admitting the next message on this ordered channel.
+		// A separate worker can process a late cancel after the old macro has
+		// finished and its replacement has started, canceling the replacement.
+		if hidrpc.MessageType(msg.Data[0]) == hidrpc.TypeCancelKeyboardMacroReport {
+			if !session.isClosed() {
+				rpcCancelKeyboardMacro()
+			}
+			return
+		}
+
 		// Enqueue to ensure ordered processing
 		queueIndex := hidrpc.GetQueueIndex(hidrpc.MessageType(msg.Data[0]))
 		if queueIndex >= len(session.hidQueue) || queueIndex < 0 {
@@ -166,13 +419,10 @@ func getOnHidMessageHandler(session *Session, scopedLogger *zerolog.Logger, chan
 			queueIndex = 3
 		}
 
-		queue := session.hidQueue[queueIndex]
-		if queue != nil {
-			queue <- hidQueueMessage{
-				DataChannelMessage: msg,
-				channel:            channel,
-			}
-		} else {
+		if ok := session.enqueueHidMessage(queueIndex, hidQueueMessage{
+			DataChannelMessage: msg,
+			channel:            channel,
+		}); !ok {
 			l.Warn().Int("queueIndex", queueIndex).Msg("received data in HID RPC message handler, but queue is nil")
 			return
 		}
@@ -183,6 +433,13 @@ func newSession(config SessionConfig) (*Session, error) {
 	webrtcSettingEngine := webrtc.SettingEngine{
 		LoggerFactory: logging.GetPionDefaultLoggerFactory(),
 	}
+
+	if config.MDNSMode != "" && config.MDNSMode != "disabled" {
+		webrtcSettingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeQueryOnly)
+	} else {
+		webrtcSettingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	}
+
 	iceServer := webrtc.ICEServer{}
 
 	var scopedLogger *zerolog.Logger
@@ -202,14 +459,57 @@ func newSession(config SessionConfig) (*Session, error) {
 		}
 
 		if config.LocalIP == "" || net.ParseIP(config.LocalIP) == nil {
-			scopedLogger.Info().Str("localIP", config.LocalIP).Msg("Local IP address not provided or invalid, won't set NAT1To1IPs")
+			scopedLogger.Info().Str("localIP", config.LocalIP).Msg("Local IP address not provided or invalid, won't set ICEAddressRewriteRules")
 		} else {
-			webrtcSettingEngine.SetNAT1To1IPs([]string{config.LocalIP}, webrtc.ICECandidateTypeSrflx)
-			scopedLogger.Info().Str("localIP", config.LocalIP).Msg("Setting NAT1To1IPs")
+			err := webrtcSettingEngine.SetICEAddressRewriteRules(
+				webrtc.ICEAddressRewriteRule{
+					CIDR:            "0.0.0.0/0",
+					External:        []string{config.LocalIP},
+					Mode:            webrtc.ICEAddressRewriteAppend,
+					AsCandidateType: webrtc.ICECandidateTypeSrflx,
+				},
+			)
+			if err != nil {
+				scopedLogger.Warn().Err(err).Str("localIP", config.LocalIP).Msg("Failed to set ICEAddressRewriteRules")
+			} else {
+				scopedLogger.Info().Str("localIP", config.LocalIP).Msg("Set ICEAddressRewriteRules for local IP")
+			}
 		}
 	}
 
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(webrtcSettingEngine))
+	mediaEngine := &webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		scopedLogger.Warn().Err(err).Msg("Failed to register default codecs")
+		return nil, err
+	}
+	// Negotiate the playout-delay RTP header extension on both audio and
+	// video. The interceptor below stamps min=max=0 on every outgoing
+	// packet so Chrome's receive-side jitter buffer can't ratchet upward.
+	// Audio is registered too because Chrome's AV-sync layer pulls video
+	// up to whatever the audio jitter buffer is — pinning video alone
+	// isn't enough when the USB UAC1 capture path has any inherent
+	// latency.
+	for _, kind := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+		if err := mediaEngine.RegisterHeaderExtension(
+			webrtc.RTPHeaderExtensionCapability{URI: playoutdelay.URI},
+			kind,
+		); err != nil {
+			scopedLogger.Warn().Err(err).Msg("Failed to register playout-delay header extension")
+			return nil, err
+		}
+	}
+	interceptorRegistry := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
+		scopedLogger.Warn().Err(err).Msg("Failed to register default interceptors")
+		return nil, err
+	}
+	interceptorRegistry.Add(playoutdelay.NewFactory())
+
+	api := webrtc.NewAPI(
+		webrtc.WithSettingEngine(webrtcSettingEngine),
+		webrtc.WithMediaEngine(mediaEngine),
+		webrtc.WithInterceptorRegistry(interceptorRegistry),
+	)
 	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{iceServer},
 	})
@@ -218,20 +518,35 @@ func newSession(config SessionConfig) (*Session, error) {
 		return nil, err
 	}
 
-	session := &Session{peerConnection: peerConnection}
-	session.rpcQueue = make(chan webrtc.DataChannelMessage, 256)
+	session := &Session{
+		peerConnection: peerConnection,
+		done:           make(chan struct{}),
+		rpcQueue:       make(chan webrtc.DataChannelMessage, 256),
+	}
 	session.initQueues()
 	session.initKeysDownStateQueue()
 
+	rpcQueue := session.rpcQueue
 	go func() {
-		for msg := range session.rpcQueue {
-			// TODO: only use goroutine if the task is asynchronous
-			go onRPCMessage(msg, session)
+		for {
+			select {
+			case <-session.done:
+				return
+			default:
+			}
+
+			select {
+			case <-session.done:
+				return
+			case msg := <-rpcQueue:
+				// TODO: only use goroutine if the task is asynchronous
+				go onRPCMessage(msg, session)
+			}
 		}
 	}()
 
-	for i := 0; i < len(session.hidQueue); i++ {
-		go session.handleQueues(i)
+	for _, queue := range session.hidQueue {
+		go session.handleHidQueue(queue)
 	}
 
 	peerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
@@ -256,15 +571,21 @@ func newSession(config SessionConfig) (*Session, error) {
 			session.RPCChannel = d
 			d.OnMessage(func(msg webrtc.DataChannelMessage) {
 				// Enqueue to ensure ordered processing
-				session.rpcQueue <- msg
+				session.enqueueRPCMessage(msg)
 			})
-			triggerOTAStateUpdate()
-			triggerVideoStateUpdate()
-			triggerUSBStateUpdate()
+			// Wait for channel to be open before sending initial state
+			d.OnOpen(func() {
+				triggerOTAStateUpdate(otaState.ToRPCState())
+				triggerVideoStateUpdate()
+				triggerUSBStateUpdate()
+				notifyFailsafeMode(session)
+			})
 		case "terminal":
 			handleTerminalChannel(d)
 		case "serial":
 			handleSerialChannel(d)
+		case "cdcacm":
+			handleCDCACMChannel(d)
 		default:
 			if strings.HasPrefix(d.Label(), uploadIdPrefix) {
 				go handleUploadChannel(d)
@@ -272,34 +593,11 @@ func newSession(config SessionConfig) (*Session, error) {
 		}
 	})
 
-	session.VideoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "kvm")
-	if err != nil {
-		scopedLogger.Warn().Err(err).Msg("Failed to create VideoTrack")
-		return nil, err
-	}
-
-	rtpSender, err := peerConnection.AddTrack(session.VideoTrack)
-	if err != nil {
-		scopedLogger.Warn().Err(err).Msg("Failed to add VideoTrack to PeerConnection")
-		return nil, err
-	}
-
-	// Read incoming RTCP packets
-	// Before these packets are returned they are processed by interceptors. For things
-	// like NACK this needs to be called.
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
-				return
-			}
-		}
-	}()
 	var isConnected bool
 
 	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		scopedLogger.Info().Interface("candidate", candidate).Msg("WebRTC peerConnection has a new ICE candidate")
-		if candidate != nil {
+		if candidate != nil && config.ws != nil {
 			err := wsjson.Write(context.Background(), config.ws, gin.H{"type": "new-ice-candidate", "data": candidate.ToJSON()})
 			if err != nil {
 				scopedLogger.Warn().Err(err).Msg("failed to write new-ice-candidate to WebRTC signaling channel")
@@ -312,16 +610,20 @@ func newSession(config SessionConfig) (*Session, error) {
 		if connectionState == webrtc.ICEConnectionStateConnected {
 			if !isConnected {
 				isConnected = true
-				actionSessions++
 				onActiveSessionsChanged()
-				if actionSessions == 1 {
-					onFirstSessionConnected()
+				if incrActiveSessions() == 1 {
+					onFirstSessionConnected(session)
+				}
+				onSessionConnected(session)
+				if mqttManager != nil {
+					mqttManager.publishSessionsState()
 				}
 			}
 		}
 		//state changes on closing browser tab disconnected->failed, we need to manually close it
-		if connectionState == webrtc.ICEConnectionStateFailed {
-			scopedLogger.Debug().Msg("ICE Connection State is failed, closing peerConnection")
+		if connectionState == webrtc.ICEConnectionStateDisconnected ||
+			connectionState == webrtc.ICEConnectionStateFailed {
+			scopedLogger.Debug().Str("state", connectionState.String()).Msg("ICE connection lost, closing peerConnection")
 			_ = peerConnection.Close()
 		}
 		if connectionState == webrtc.ICEConnectionStateClosed {
@@ -329,22 +631,19 @@ func newSession(config SessionConfig) (*Session, error) {
 			if session == currentSession {
 				// Cancel any ongoing keyboard report multi when session closes
 				cancelKeyboardMacro()
+				// Stop pending auto-release timers (avoids unnecessary work),
+				// then clear all keys. keyboardMutex inside KeyboardReport
+				// serialises with any auto-release goroutine already in flight,
+				// so the clear is guaranteed to be the final state.
+				gadget.CancelAllAutoReleaseTimers()
+				_ = rpcKeyboardReport(0, keyboardClearStateKeys)
 				currentSession = nil
 			}
-			// Stop RPC processor
-			if session.rpcQueue != nil {
-				close(session.rpcQueue)
-				session.rpcQueue = nil
-			}
+			session.close()
 
-			// Stop HID RPC processor
-			for i := 0; i < len(session.hidQueue); i++ {
-				close(session.hidQueue[i])
-				session.hidQueue[i] = nil
-			}
-
-			close(session.keysDownStateQueue)
-			session.keysDownStateQueue = nil
+			// Release audio capture if this session owned it; otherwise the
+			// goroutine would keep writing samples to a now-dead track.
+			stopAudioIfOwner(session.AudioTrack)
 
 			if session.shouldUmountVirtualMedia {
 				if err := rpcUnmountImage(); err != nil {
@@ -353,10 +652,13 @@ func newSession(config SessionConfig) (*Session, error) {
 			}
 			if isConnected {
 				isConnected = false
-				actionSessions--
 				onActiveSessionsChanged()
-				if actionSessions == 0 {
+				if decrActiveSessions() == 0 {
+					scopedLogger.Info().Msg("last session disconnected, stopping video stream")
 					onLastSessionDisconnected()
+				}
+				if mqttManager != nil {
+					mqttManager.publishSessionsState()
 				}
 			}
 		}
@@ -364,16 +666,50 @@ func newSession(config SessionConfig) (*Session, error) {
 	return session, nil
 }
 
-var actionSessions = 0
-
 func onActiveSessionsChanged() {
-	requestDisplayUpdate(true)
+	notifyFailsafeMode(currentSession)
+	requestDisplayUpdate(false, "active_sessions_changed")
 }
 
-func onFirstSessionConnected() {
-	_ = writeCtrlAction("start_video")
+// onFirstSessionConnected runs once on the 0→1 active-session edge. Video
+// capture is a shared pipeline; starting it again on a handoff connect (count
+// 1→2) would issue redundant native start calls and re-run the sleep-mode
+// re-lock wait while video is already streaming.
+func sessionVideoCodecType(session *Session) int {
+	if session.codecMimeType == webrtc.MimeTypeH265 {
+		return 1
+	}
+	return 0
+}
+
+func startNativeVideoForSession(session *Session) {
+	_ = nativeInstance.VideoSetCodecType(sessionVideoCodecType(session))
+	_ = nativeInstance.VideoStart()
+}
+
+func onFirstSessionConnected(session *Session) {
+	stopVideoSleepModeTicker()
+	_ = setHostDisplayAdvertised(true, "first_session_connected", false)
+	startNativeVideoForSession(session)
+}
+
+// onSessionConnected runs per session when ICE reaches Connected. Uses the
+// session parameter directly rather than the currentSession global — that
+// global is assigned by the caller AFTER ExchangeOffer returns, and ICE
+// connected can fire before then, racing the assignment.
+func onSessionConnected(session *Session) {
+	notifyFailsafeMode(session)
+	if session.AudioTrack != nil {
+		startAudio(session.AudioTrack)
+	}
 }
 
 func onLastSessionDisconnected() {
-	_ = writeCtrlAction("stop_video")
+	// Safety net: ensure all keys are released when the last session disconnects
+	_ = rpcKeyboardReport(0, keyboardClearStateKeys)
+	// The closing session already released its own audio capture. A replacement
+	// may have connected since the zero-session decision, so do not stop its audio.
+	_ = nativeInstance.VideoStop()
+	_ = applyHostDisplayAdvertisement("last_session_disconnected")
+	startVideoSleepModeTicker()
 }

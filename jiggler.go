@@ -26,6 +26,9 @@ func rpcSetJigglerState(enabled bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
+	if mqttManager != nil {
+		mqttManager.publishJigglerState()
+	}
 	return nil
 }
 
@@ -132,14 +135,17 @@ func runJiggler() {
 		logger.Debug().Msgf("Time since last user input %v", timeSinceLastInput)
 		if timeSinceLastInput > time.Duration(inactivitySeconds)*time.Second {
 			logger.Debug().Msg("Jiggling mouse...")
-			//TODO: change to rel mouse
-			err := rpcAbsMouseReport(1, 1, 0)
+			dx := int8(rand.Intn(3) + 1)
+			dy := int8(rand.Intn(3) + 1)
+			if rand.Intn(2) == 0 {
+				dx = -dx
+			}
+			if rand.Intn(2) == 0 {
+				dy = -dy
+			}
+			err := rpcRelMouseReport(dx, dy, 0)
 			if err != nil {
 				logger.Warn().Msgf("Failed to jiggle mouse: %v", err)
-			}
-			err = rpcAbsMouseReport(0, 0, 0)
-			if err != nil {
-				logger.Warn().Msgf("Failed to reset mouse position: %v", err)
 			}
 		}
 	}

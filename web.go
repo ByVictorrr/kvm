@@ -210,6 +210,7 @@ func setupRouter() *gin.Engine {
 		protected.POST("/storage/upload", handleUploadHttp)
 
 		protected.POST("/device/send-wol/:mac-addr", handleSendWOLMagicPacket)
+
 		protected.POST("/api/ekl/input/:input", handleEKLInput)
 
 		protected.GET("/diagnostics", handleDiagnosticsDownload)

@@ -11,6 +11,7 @@ func ErrorfL(l *zerolog.Logger, format string, err error, args ...any) error {
 
 var (
 	logger          = logging.GetSubsystemLogger("jetkvm")
+	failsafeLogger  = logging.GetSubsystemLogger("failsafe")
 	networkLogger   = logging.GetSubsystemLogger("network")
 	cloudLogger     = logging.GetSubsystemLogger("cloud")
 	websocketLogger = logging.GetSubsystemLogger("websocket")
@@ -25,9 +26,12 @@ var (
 	otaLogger       = logging.GetSubsystemLogger("ota")
 	serialLogger    = logging.GetSubsystemLogger("serial")
 	terminalLogger  = logging.GetSubsystemLogger("terminal")
+	cdcACMLogger    = logging.GetSubsystemLogger("cdcacm")
 	displayLogger   = logging.GetSubsystemLogger("display")
+	audioLogger     = logging.GetSubsystemLogger("audio")
 	wolLogger       = logging.GetSubsystemLogger("wol")
 	usbLogger       = logging.GetSubsystemLogger("usb")
+	tailscaleLogger = logging.GetSubsystemLogger("tailscale")
 	// external components
 	ginLogger = logging.GetSubsystemLogger("gin")
 )
