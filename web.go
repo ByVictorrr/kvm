@@ -1,15 +1,19 @@
 package kvm
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -20,7 +24,9 @@ import (
 	gin_logger "github.com/gin-contrib/logger"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jetkvm/kvm/internal/diagnostics"
 	"github.com/jetkvm/kvm/internal/logging"
+	"github.com/jetkvm/kvm/internal/supervisor"
 	"github.com/pion/webrtc/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -72,10 +78,36 @@ var cachableFileExtensions = []string{
 	".jpg", ".jpeg", ".png", ".svg", ".gif", ".webp", ".ico", ".woff2",
 }
 
+// MinPasswordLength is the minimum required length for new passwords.
+// This is only enforced when setting or changing passwords, not when
+// validating existing passwords (to maintain backward compatibility).
+const MinPasswordLength = 8
+
+// MaxPasswordLength is the maximum length bcrypt can hash. Go's bcrypt
+// implementation rejects passwords over 72 bytes rather than silently
+// truncating them.
+const MaxPasswordLength = 72
+
+const (
+	// Cache durations for HTTP responses, in seconds.
+	cacheImmutableMaxAge = 365 * 24 * 60 * 60 // 1 year
+	cacheShortMaxAge     = 5 * 60             // 5 minutes
+
+	// authTokenMaxAge is the lifetime of the authToken cookie, in seconds.
+	authTokenMaxAge = 7 * 24 * 60 * 60 // 1 week
+)
+
 func setupRouter() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	gin.DisableConsoleColor()
 	r := gin.Default()
+	// The device is reached directly, not behind a reverse proxy, so don't
+	// trust any X-Forwarded-For/X-Real-IP headers. Without this, gin trusts
+	// all proxies by default and c.ClientIP() returns a client-controlled
+	// value, letting a caller spoof their IP to evade the login rate limiter.
+	if err := r.SetTrustedProxies(nil); err != nil {
+		logger.Fatal().Err(err).Msg("failed to disable trusted proxies")
+	}
 	r.Use(gin_logger.SetLogger(
 		gin_logger.WithLogger(func(*gin.Context, zerolog.Logger) zerolog.Logger {
 			return *ginLogger
@@ -90,13 +122,21 @@ func setupRouter() *gin.Engine {
 		staticFS.(fs.ReadDirFS),
 	))
 
+	// Security headers middleware
+	r.Use(func(c *gin.Context) {
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-XSS-Protection", "1; mode=block")
+		c.Next()
+	})
+
 	// Add a custom middleware to set cache headers for images
 	// This is crucial for optimizing the initial welcome screen load time
 	// By enabling caching, we ensure that pre-loaded images are stored in the browser cache
 	// This allows for a smoother enter animation and improved user experience on the welcome screen
 	r.Use(func(c *gin.Context) {
 		if strings.HasPrefix(c.Request.URL.Path, "/static/assets/immutable/") {
-			c.Header("Cache-Control", "public, max-age=31536000, immutable") // Cache for 1 year
+			c.Header("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", cacheImmutableMaxAge))
 			c.Next()
 			return
 		}
@@ -104,7 +144,7 @@ func setupRouter() *gin.Engine {
 		if strings.HasPrefix(c.Request.URL.Path, "/static/") {
 			ext := filepath.Ext(c.Request.URL.Path)
 			if slices.Contains(cachableFileExtensions, ext) {
-				c.Header("Cache-Control", "public, max-age=300") // Cache for 5 minutes
+				c.Header("Cache-Control", fmt.Sprintf("public, max-age=%d", cacheShortMaxAge))
 			}
 		}
 
@@ -113,7 +153,7 @@ func setupRouter() *gin.Engine {
 
 	r.GET("/robots.txt", func(c *gin.Context) {
 		c.Header("Content-Type", "text/plain")
-		c.Header("Cache-Control", "public, max-age=31536000, immutable") // Cache for 1 year
+		c.Header("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", cacheImmutableMaxAge))
 		c.String(http.StatusOK, "User-agent: *\nDisallow: /")
 	})
 
@@ -158,22 +198,6 @@ func setupRouter() *gin.Engine {
 	protected := r.Group("/")
 	protected.Use(protectedMiddleware())
 	{
-		/*
-		 * Legacy WebRTC session endpoint
-		 *
-		 * This endpoint is maintained for backward compatibility when users upgrade from a version
-		 * using the legacy HTTP-based signaling method to the new WebSocket-based signaling method.
-		 *
-		 * During the upgrade process, when the "Rebooting device after update..." message appears,
-		 * the browser still runs the previous JavaScript code which polls this endpoint to establish
-		 * a new WebRTC session. Once the session is established, the page will automatically reload
-		 * with the updated code.
-		 *
-		 * Without this endpoint, the stale JavaScript would fail to establish a connection,
-		 * causing users to see the "Rebooting device after update..." message indefinitely
-		 * until they manually refresh the page, leading to a confusing user experience.
-		 */
-		protected.POST("/webrtc/session", handleWebRTCSession)
 		protected.GET("/webrtc/signaling/client", handleLocalWebRTCSignal)
 		protected.POST("/cloud/register", handleCloudRegister)
 		protected.GET("/cloud/state", handleCloudState)
@@ -184,6 +208,11 @@ func setupRouter() *gin.Engine {
 		protected.PUT("/auth/password-local", handleUpdatePassword)
 		protected.DELETE("/auth/local-password", handleDeletePassword)
 		protected.POST("/storage/upload", handleUploadHttp)
+
+		protected.POST("/device/send-wol/:mac-addr", handleSendWOLMagicPacket)
+		protected.POST("/api/ekl/input/:input", handleEKLInput)
+
+		protected.GET("/diagnostics", handleDiagnosticsDownload)
 	}
 
 	// Catch-all route for SPA
@@ -200,41 +229,6 @@ func setupRouter() *gin.Engine {
 
 // TODO: support multiple sessions?
 var currentSession *Session
-
-func handleWebRTCSession(c *gin.Context) {
-	var req WebRTCSessionRequest
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	session, err := newSession(SessionConfig{})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err})
-		return
-	}
-
-	sd, err := session.ExchangeOffer(req.Sd)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err})
-		return
-	}
-	if currentSession != nil {
-		writeJSONRPCEvent("otherSessionConnected", nil, currentSession)
-		peerConn := currentSession.peerConnection
-		go func() {
-			time.Sleep(1 * time.Second)
-			_ = peerConn.Close()
-		}()
-	}
-
-	// Cancel any ongoing keyboard macro when session changes
-	cancelKeyboardMacro()
-
-	currentSession = session
-	c.JSON(http.StatusOK, gin.H{"sd": sd})
-}
 
 var (
 	pingMessage = []byte("ping")
@@ -269,7 +263,8 @@ func handleLocalWebRTCSignal(c *gin.Context) {
 
 	wsCon, err := websocket.Accept(c.Writer, c.Request, wsOptions)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		scopedLogger.Warn().Err(err).Msg("failed to accept websocket connection")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to establish WebSocket connection"})
 		return
 	}
 
@@ -278,14 +273,14 @@ func handleLocalWebRTCSignal(c *gin.Context) {
 
 	err = wsjson.Write(context.Background(), wsCon, gin.H{"type": "device-metadata", "data": gin.H{"deviceVersion": builtAppVersion}})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		scopedLogger.Warn().Err(err).Msg("failed to write device metadata")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send device metadata"})
 		return
 	}
 
 	err = handleWebRTCSignalWsMessages(wsCon, false, source, connectionID, &scopedLogger)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		scopedLogger.Warn().Err(err).Msg("websocket session ended with error")
 	}
 }
 
@@ -341,7 +336,6 @@ func handleWebRTCSignalWsMessages(
 
 			l.Trace().Msg("sending ping frame")
 			err := wsCon.Ping(runCtx)
-
 			if err != nil {
 				l.Warn().Str("error", err.Error()).Msg("websocket ping error")
 				cancelRun()
@@ -468,23 +462,43 @@ func handleLogin(c *gin.Context) {
 		return
 	}
 
+	// Check rate limit before processing
+	ip := c.ClientIP()
+	if allowed, retryAfter := passwordRateLimiter.IsAllowed(ip); !allowed {
+		c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":       "Too many failed attempts. Please try again later.",
+			"retry_after": retryAfter,
+		})
+		return
+	}
+
 	var req LoginRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 		return
 	}
 
 	err := bcrypt.CompareHashAndPassword([]byte(config.HashedPassword), []byte(req.Password))
 	if err != nil {
+		passwordRateLimiter.RecordFailure(ip)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid password"})
 		return
 	}
 
+	// Clear rate limit on successful login
+	passwordRateLimiter.RecordSuccess(ip)
+
 	config.LocalAuthToken = uuid.New().String()
 
+	if err := SaveConfig(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
+		return
+	}
+
 	// Set the cookie
-	c.SetCookie("authToken", config.LocalAuthToken, 7*24*60*60, "/", "", false, true)
+	c.SetCookie("authToken", config.LocalAuthToken, authTokenMaxAge, "/", "", false, true)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Login successful"})
 }
@@ -562,12 +576,9 @@ func basicAuthProtectedMiddleware(requireDeveloperMode bool) gin.HandlerFunc {
 	}
 }
 
-func RunWebServer() {
-	r := setupRouter()
-
+func getBindAddress(listenPort int) string {
 	// Determine the binding address based on the config
 	var bindAddress string
-	listenPort := 80 // default port
 	useIPv4 := config.NetworkConfig.IPv4Mode.String != "disabled"
 	useIPv6 := config.NetworkConfig.IPv6Mode.String != "disabled"
 
@@ -588,6 +599,14 @@ func RunWebServer() {
 			bindAddress = fmt.Sprintf("[::]:%d", listenPort)
 		}
 	}
+	return bindAddress
+}
+
+func RunWebServer() {
+	r := setupRouter()
+
+	// Determine the binding address based on the config
+	bindAddress := getBindAddress(80) // default port
 
 	logger.Info().Str("bindAddress", bindAddress).Bool("loopbackOnly", config.LocalLoopbackOnly).Msg("Starting web server")
 	if err := r.Run(bindAddress); err != nil {
@@ -625,6 +644,16 @@ func handleCreatePassword(c *gin.Context) {
 		return
 	}
 
+	if len(req.Password) < MinPasswordLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 8 characters"})
+		return
+	}
+
+	if len(req.Password) > MaxPasswordLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at most 72 characters"})
+		return
+	}
+
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -640,7 +669,7 @@ func handleCreatePassword(c *gin.Context) {
 	}
 
 	// Set the cookie
-	c.SetCookie("authToken", config.LocalAuthToken, 7*24*60*60, "/", "", false, true)
+	c.SetCookie("authToken", config.LocalAuthToken, authTokenMaxAge, "/", "", false, true)
 
 	c.JSON(http.StatusCreated, gin.H{"message": "Password set successfully"})
 }
@@ -664,6 +693,17 @@ func handleUpdatePassword(c *gin.Context) {
 		return
 	}
 
+	// Validate new password length (not old password - may be shorter from before this requirement)
+	if len(req.NewPassword) < MinPasswordLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 8 characters"})
+		return
+	}
+
+	if len(req.NewPassword) > MaxPasswordLength {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at most 72 characters"})
+		return
+	}
+
 	if err := bcrypt.CompareHashAndPassword([]byte(config.HashedPassword), []byte(req.OldPassword)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Incorrect old password"})
 		return
@@ -683,7 +723,7 @@ func handleUpdatePassword(c *gin.Context) {
 	}
 
 	// Set the cookie
-	c.SetCookie("authToken", config.LocalAuthToken, 7*24*60*60, "/", "", false, true)
+	c.SetCookie("authToken", config.LocalAuthToken, authTokenMaxAge, "/", "", false, true)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Password updated successfully"})
 }
@@ -725,6 +765,18 @@ func handleDeletePassword(c *gin.Context) {
 }
 
 func handleDeviceStatus(c *gin.Context) {
+	// Add CORS headers to allow cross-origin requests
+	// This is safe because device/status is a public endpoint
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Access-Control-Allow-Methods", "GET, OPTIONS")
+	c.Header("Access-Control-Allow-Headers", "Content-Type")
+
+	// Handle preflight requests
+	if c.Request.Method == "OPTIONS" {
+		c.AbortWithStatus(http.StatusNoContent)
+		return
+	}
+
 	response := DeviceStatus{
 		IsSetup: config.LocalAuthMode != "",
 	}
@@ -749,14 +801,26 @@ func handleSetup(c *gin.Context) {
 		return
 	}
 
+	ip := c.ClientIP()
+	if allowed, retryAfter := passwordRateLimiter.IsAllowed(ip); !allowed {
+		c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":       "Too many failed attempts. Please try again later.",
+			"retry_after": retryAfter,
+		})
+		return
+	}
+
 	var req SetupRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		passwordRateLimiter.RecordFailure(ip)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 		return
 	}
 
 	if req.LocalAuthMode != "password" && req.LocalAuthMode != "noPassword" {
+		passwordRateLimiter.RecordFailure(ip)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid localAuthMode"})
 		return
 	}
@@ -765,7 +829,19 @@ func handleSetup(c *gin.Context) {
 
 	if req.LocalAuthMode == "password" {
 		if req.Password == "" {
+			passwordRateLimiter.RecordFailure(ip)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Password is required for password mode"})
+			return
+		}
+
+		if len(req.Password) < MinPasswordLength {
+			passwordRateLimiter.RecordFailure(ip)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 8 characters"})
+			return
+		}
+
+		if len(req.Password) > MaxPasswordLength {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at most 72 characters"})
 			return
 		}
 
@@ -780,7 +856,7 @@ func handleSetup(c *gin.Context) {
 		config.LocalAuthToken = uuid.New().String()
 
 		// Set the cookie
-		c.SetCookie("authToken", config.LocalAuthToken, 7*24*60*60, "/", "", false, true)
+		c.SetCookie("authToken", config.LocalAuthToken, authTokenMaxAge, "/", "", false, true)
 	} else {
 		// For noPassword mode, ensure the password field is empty
 		config.HashedPassword = ""
@@ -794,4 +870,122 @@ func handleSetup(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Device setup completed successfully"})
+}
+
+func handleSendWOLMagicPacket(c *gin.Context) {
+	inputMacAddr := c.Param("mac-addr")
+	macAddr, err := net.ParseMAC(inputMacAddr)
+	if err != nil {
+		logger.Warn().Err(err).Str("inputMacAddr", inputMacAddr).Msg("Invalid MAC address provided")
+		c.String(http.StatusBadRequest, "Invalid mac address provided")
+		return
+	}
+
+	macAddrString := macAddr.String()
+	broadcastIP := c.Query("broadcastIP")
+	err = rpcSendWOLMagicPacket(macAddrString, broadcastIP)
+	if err != nil {
+		logger.Warn().Err(err).Str("macAddrString", macAddrString).Msg("Failed to send WOL magic packet")
+		c.String(http.StatusInternalServerError, "Failed to send WOL to %s: %v", macAddrString, err)
+		return
+	}
+
+	c.String(http.StatusOK, "WOL sent to %s ", macAddr)
+}
+
+func handleDiagnosticsDownload(c *gin.Context) {
+	pr, pw := io.Pipe()
+
+	go func() {
+		defer pw.Close()
+
+		zw := zip.NewWriter(pw)
+
+		// 1. Application log (full, no truncation)
+		if err := addFileToZip(zw, "app.log", supervisor.AppLogPath); err != nil {
+			logger.Warn().Err(err).Msg("failed to add app log to diagnostics zip")
+		}
+
+		// 2. System diagnostics
+		var diagBuf bytes.Buffer
+		diag := diagnostics.New(diagnostics.Options{
+			Writer: &diagBuf,
+			GetSessionInfo: func() diagnostics.SessionInfo {
+				info := diagnostics.SessionInfo{
+					ActiveSessions:    getActiveSessions(),
+					HasCurrentSession: currentSession != nil,
+				}
+				if currentSession != nil {
+					sessionInfo := currentSession.GetDiagnosticsInfo()
+					info.ICEConnectionState = sessionInfo.ICEConnectionState
+					info.SignalingState = sessionInfo.SignalingState
+					info.ConnectionState = sessionInfo.ConnectionState
+					info.DataChannels = sessionInfo.DataChannels
+				}
+				return info
+			},
+		})
+		diag.LogAll("download")
+		if err := addBytesToZip(zw, "system-diagnostics.txt", diagBuf.Bytes()); err != nil {
+			logger.Warn().Err(err).Msg("failed to add system diagnostics to zip")
+		}
+
+		// 3. All crash dumps (full content)
+		if entries, err := filepath.Glob(filepath.Join(supervisor.ErrorDumpDir, "jetkvm-*.log")); err == nil {
+			for _, path := range entries {
+				if err := addFileToZip(zw, "crashes/"+filepath.Base(path), path); err != nil {
+					logger.Warn().Err(err).Str("path", path).Msg("failed to add crash dump to zip")
+				}
+			}
+		}
+
+		// 4. Configuration (with secrets redacted)
+		redactedConfig := *config
+		redactedConfig.CloudToken = ""
+		redactedConfig.LocalAuthToken = ""
+		redactedConfig.HashedPassword = ""
+		redactedConfig.GoogleIdentity = ""
+		if configData, err := json.MarshalIndent(redactedConfig, "", "  "); err == nil {
+			if err := addBytesToZip(zw, "config.json", configData); err != nil {
+				logger.Warn().Err(err).Msg("failed to add config to zip")
+			}
+		}
+
+		// Close ZIP writer to write central directory (required for valid ZIP)
+		if err := zw.Close(); err != nil {
+			logger.Error().Err(err).Msg("failed to finalize diagnostics zip")
+		}
+	}()
+
+	filename := fmt.Sprintf("jetkvm-diagnostics-%s.zip", time.Now().Format("20060102-150405"))
+	extraHeaders := map[string]string{
+		"Content-Disposition": fmt.Sprintf("attachment; filename=%s", filename),
+	}
+
+	c.DataFromReader(http.StatusOK, -1, "application/zip", pr, extraHeaders)
+}
+
+func addFileToZip(zw *zip.Writer, name, srcPath string) error {
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w, err := zw.Create(name)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(w, f)
+	return err
+}
+
+func addBytesToZip(zw *zip.Writer, name string, data []byte) error {
+	w, err := zw.Create(name)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
 }
