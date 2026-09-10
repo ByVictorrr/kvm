@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { LuMonitorCheck, LuMonitor } from "react-icons/lu";
 
-import { JsonRpcResponse, useJsonRpc } from "@hooks/useJsonRpc";
+import { JsonRpcResponse, useJsonRpc } from "@/hooks/useJsonRpc";
 import Card from "@components/Card";
 import { SettingsPageHeader } from "@components/SettingsPageheader";
 import notifications from "@/notifications";
