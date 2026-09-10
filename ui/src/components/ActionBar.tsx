@@ -1,5 +1,5 @@
 import { MdOutlineContentPasteGo } from "react-icons/md";
-import { LuCable, LuHardDrive, LuMaximize, LuSettings, LuSignal } from "react-icons/lu";
+import { LuCable, LuHardDrive, LuMaximize, LuMonitor, LuSettings, LuSignal } from "react-icons/lu";
 import { FaKeyboard } from "react-icons/fa6";
 import { Popover, PopoverButton, PopoverPanel } from "@headlessui/react";
 import { Fragment, useCallback, useRef } from "react";
@@ -18,6 +18,7 @@ import PasteModal from "@/components/popovers/PasteModal";
 import WakeOnLanModal from "@/components/popovers/WakeOnLan/Index";
 import MountPopopover from "@/components/popovers/MountPopover";
 import ExtensionPopover from "@/components/popovers/ExtensionPopover";
+import { EKLKVMSwitch } from "@/components/extensions/EKLKVMSwitch";
 import { useDeviceUiNavigation } from "@/hooks/useAppNavigation";
 
 export default function Actionbar({
@@ -194,6 +195,33 @@ export default function Actionbar({
               </PopoverPanel>
             </Popover>
           </div>
+
+          {/* ── KVM Switch — quick-access popover ────────────────────────── */}
+          <Popover>
+            <PopoverButton as={Fragment}>
+              <Button
+                size="XS"
+                theme="light"
+                text="KVM"
+                LeadingIcon={LuMonitor}
+                onClick={() => setDisableVideoFocusTrap(true)}
+              />
+            </PopoverButton>
+            <PopoverPanel
+              anchor="bottom start"
+              transition
+              className={cx(
+                "z-10 w-72 origin-top overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg dark:border-slate-700 dark:bg-slate-800",
+                "transition duration-200 ease-out data-closed:translate-y-2 data-closed:opacity-0",
+              )}
+            >
+              {({ open }) => {
+                checkIfStateChanged(open);
+                return <EKLKVMSwitch compact />;
+              }}
+            </PopoverPanel>
+          </Popover>
+
           <div className="hidden lg:block">
             <Button
               size="XS"
