@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { LuMonitorCheck, LuMonitor } from "react-icons/lu";
 
-import { JsonRpcResponse, useJsonRpc } from "@/hooks/useJsonRpc";
 import Card from "@components/Card";
 import { SettingsPageHeader } from "@components/SettingsPageheader";
 import notifications from "@/notifications";
@@ -19,22 +18,6 @@ const EKL_SERVER_NAMES = [
   "Server 8",
 ];
 
-/**
- * Builds the 5-byte eKL 81HK RS-232 command string for the given input (1-8).
- *
- * Protocol (eKL 81HK documentation, 115200 8N1):
- *   Input N → bytes: 0x30 0x30 (0x30+N-1) 0x0A 0x0D
- *
- * In JavaScript strings:
- *   '0'  = 0x30, '\n' = 0x0A (LF), '\r' = 0x0D (CR)
- *
- * JSON serialises these as escape sequences (\n, \r) which JetKVM's
- * Go backend unescapes before writing raw bytes to /dev/ttyS3.
- */
-function eklCommand(input: number): string {
-  return `00${input - 1}\n\r`;
-}
-
 interface EKLKVMSwitchProps {
   /** When true the component renders in compact (toolbar-popover) mode. */
   compact?: boolean;
@@ -43,20 +26,24 @@ interface EKLKVMSwitchProps {
 export function EKLKVMSwitch({ compact = false }: EKLKVMSwitchProps) {
   const [activeInput, setActiveInput] = useState<number | null>(null);
   const [pendingInput, setPendingInput] = useState<number | null>(null);
-  const { send } = useJsonRpc();
 
-  const handleSwitch = (input: number) => {
+  const handleSwitch = async (input: number) => {
     if (pendingInput !== null) return;
     setPendingInput(input);
 
-    send("sendCustomCommand", { command: eklCommand(input) }, (resp: JsonRpcResponse) => {
-      setPendingInput(null);
-      if ("error" in resp) {
-        notifications.error(`KVM switch failed: ${resp.error.data ?? "Unknown error"}`);
+    try {
+      const resp = await fetch(`/api/ekl/input/${input}`, { method: "POST" });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => ({}));
+        notifications.error(`KVM switch failed: ${body.error ?? resp.statusText}`);
         return;
       }
       setActiveInput(input);
-    });
+    } catch (err) {
+      notifications.error(`KVM switch failed: ${err}`);
+    } finally {
+      setPendingInput(null);
+    }
   };
 
   const grid = (
