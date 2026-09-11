@@ -3,13 +3,14 @@ package timesync
 import (
 	"context"
 	"math/rand/v2"
+	"net"
 	"strconv"
 	"time"
 
 	"github.com/beevik/ntp"
 )
 
-var defaultNTPServerIPs = []string{
+var DefaultNTPServerIPs = []string{
 	// These servers are known by static IP and as such don't need DNS lookups
 	// These are from Google and Cloudflare since if they're down, the internet
 	// is broken anyway
@@ -27,17 +28,59 @@ var defaultNTPServerIPs = []string{
 	"2001:4860:4806:c::", // time.google.com IPv6
 }
 
-var defaultNTPServerHostnames = []string{
-	// should use something from https://github.com/jauderho/public-ntp-servers
+var DefaultNTPServerHostnames = []string{
 	"time.apple.com",
 	"time.aws.com",
 	"time.windows.com",
 	"time.google.com",
 	"time.cloudflare.com",
-	"pool.ntp.org",
+}
+
+func (t *TimeSync) filterNTPServers(ntpServers []string) ([]string, error) {
+	if len(ntpServers) == 0 {
+		return nil, nil
+	}
+
+	hasIPv4, err := t.preCheckIPv4()
+	if err != nil {
+		t.l.Error().Err(err).Msg("failed to check IPv4")
+		return nil, err
+	}
+
+	hasIPv6, err := t.preCheckIPv6()
+	if err != nil {
+		t.l.Error().Err(err).Msg("failed to check IPv6")
+		return nil, err
+	}
+
+	filteredServers := []string{}
+	for _, server := range ntpServers {
+		ip := net.ParseIP(server)
+		t.l.Trace().Str("server", server).Interface("ip", ip).Msg("checking NTP server")
+		if ip == nil {
+			// Not a literal IP — treat as a hostname and pass through.
+			// The NTP library handles DNS resolution itself.
+			filteredServers = append(filteredServers, server)
+			continue
+		}
+
+		if hasIPv4 && ip.To4() != nil {
+			filteredServers = append(filteredServers, server)
+		}
+		if hasIPv6 && ip.To16() != nil {
+			filteredServers = append(filteredServers, server)
+		}
+	}
+	return filteredServers, nil
 }
 
 func (t *TimeSync) queryNetworkTime(ntpServers []string) (now *time.Time, offset *time.Duration) {
+	ntpServers, err := t.filterNTPServers(ntpServers)
+	if err != nil {
+		t.l.Error().Err(err).Msg("failed to filter NTP servers")
+		return nil, nil
+	}
+
 	chunkSize := int(t.networkConfig.TimeSyncParallel.ValueOr(4))
 	t.l.Info().Strs("servers", ntpServers).Int("chunkSize", chunkSize).Msg("querying NTP servers")
 
@@ -79,8 +122,8 @@ func (t *TimeSync) queryMultipleNTP(servers []string, timeout time.Duration) (no
 			// query the server
 			now, response, err := queryNtpServer(server, timeout)
 			if err != nil {
-				scopedLogger.Warn().
-					Str("error", err.Error()).
+				scopedLogger.Debug().
+					Err(err).
 					Msg("failed to query NTP server")
 				results <- nil
 				return

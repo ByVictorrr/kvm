@@ -2,18 +2,49 @@ package kvm
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/jetkvm/kvm/internal/ota"
+
+	"github.com/erikdubbelboer/gspt"
 	"github.com/gwatts/rootcerts"
+	"github.com/rs/zerolog"
 )
 
 var appCtx context.Context
+var procPrefix string = "jetkvm: [app]"
+
+func setProcTitle(status string) {
+	if status != "" {
+		status = " " + status
+	}
+	title := fmt.Sprintf("%s%s", procPrefix, status)
+	gspt.SetProcTitle(title)
+}
 
 func Main() {
+	setProcTitle("starting")
+
+	logger.Log().Msg("JetKVM Starting Up")
+
+	defer func() {
+		if r := recover(); r != nil {
+			logger.WithLevel(zerolog.PanicLevel).Interface("error", r).Msg("Received panic")
+			panic(r) // Re-panic to crash as usual
+		}
+	}()
+
+	checkFailsafeReason()
+	if failsafeModeActive {
+		procPrefix = "jetkvm: [app+failsafe]"
+		logger.Warn().Str("reason", failsafeModeReason).Msg("failsafe mode activated")
+	}
+
 	LoadConfig()
 
 	var cancel context.CancelFunc
@@ -31,7 +62,14 @@ func Main() {
 		Msg("starting JetKVM")
 
 	go runWatchdog()
-	go confirmCurrentSystem()
+
+	// initialize usb gadget
+	setProcTitle("initUsbGadget")
+	initUsbGadget()
+
+	setProcTitle("initNative")
+	initNative(systemVersionLocal, appVersionLocal)
+	initDisplay()
 
 	http.DefaultClient.Timeout = 1 * time.Minute
 
@@ -43,40 +81,31 @@ func Main() {
 		Int("ca_certs_loaded", len(rootcerts.Certs())).
 		Msg("loaded Root CA certificates")
 
+	initOta()
+
+	http.DefaultClient.Timeout = 1 * time.Minute
+
 	// Initialize network
+	setProcTitle("initNetwork")
 	if err := initNetwork(); err != nil {
 		logger.Error().Err(err).Msg("failed to initialize network")
+		// TODO: reset config to default
 		os.Exit(1)
 	}
 
 	// Initialize time sync
+	setProcTitle("initTimeSync")
 	initTimeSync()
 	timeSync.Start()
 
 	// Initialize mDNS
+	setProcTitle("initMdns")
 	if err := initMdns(); err != nil {
 		logger.Error().Err(err).Msg("failed to initialize mDNS")
-		os.Exit(1)
 	}
 
-	// Initialize native ctrl socket server
-	StartNativeCtrlSocketServer()
-
-	// Initialize native video socket server
-	StartNativeVideoSocketServer()
-
+	setProcTitle("initPrometheus")
 	initPrometheus()
-
-	go func() {
-		err = ExtractAndRunNativeBin()
-		if err != nil {
-			logger.Warn().Err(err).Msg("failed to extract and run native bin")
-			//TODO: prepare an error message screen buffer to show on kvm screen
-		}
-	}()
-
-	// initialize usb gadget
-	initUsbGadget()
 	if err := setInitialVirtualMediaState(); err != nil {
 		logger.Warn().Err(err).Msg("failed to set initial virtual media state")
 	}
@@ -86,20 +115,28 @@ func Main() {
 	}
 	initJiggler()
 
-	// initialize display
-	initDisplay()
+	// Initialize MQTT
+	initMQTT()
+	defer func() {
+		if mqttManager != nil {
+			mqttManager.Close()
+		}
+	}()
+
+	// start video sleep mode timer
+	startVideoSleepModeTicker()
 
 	go func() {
+		// wait for 15 minutes before starting auto-update checks
+		// this is to avoid interfering with initial setup processes
+		// and to ensure the system is stable before checking for updates
 		time.Sleep(15 * time.Minute)
-		for {
-			logger.Debug().Bool("auto_update_enabled", config.AutoUpdateEnabled).Msg("UPDATING")
-			if !config.AutoUpdateEnabled {
-				return
-			}
 
-			if isTimeSyncNeeded() || !timeSync.IsSyncSuccess() {
-				logger.Debug().Msg("system time is not synced, will retry in 30 seconds")
-				time.Sleep(30 * time.Second)
+		for {
+			logger.Info().Bool("auto_update_enabled", config.AutoUpdateEnabled).Msg("auto-update check")
+			if !config.AutoUpdateEnabled {
+				logger.Debug().Msg("auto-update disabled")
+				time.Sleep(5 * time.Minute) // we'll check if auto-updates are enabled in five minutes
 				continue
 			}
 
@@ -109,8 +146,18 @@ func Main() {
 				continue
 			}
 
+			if isTimeSyncNeeded() || !timeSync.IsSyncSuccess() {
+				logger.Debug().Msg("system time is not synced, will retry in 30 seconds")
+				time.Sleep(30 * time.Second)
+				continue
+			}
+
 			includePreRelease := config.IncludePreRelease
-			err = TryUpdate(context.Background(), GetDeviceID(), includePreRelease)
+			err = otaState.TryUpdate(context.Background(), ota.UpdateParams{
+				DeviceID:          GetDeviceID(),
+				SKU:               GetDeviceSKU(),
+				IncludePreRelease: includePreRelease,
+			})
 			if err != nil {
 				logger.Warn().Err(err).Msg("failed to auto update")
 			}
@@ -118,6 +165,7 @@ func Main() {
 			time.Sleep(1 * time.Hour)
 		}
 	}()
+
 	//go RunFuseServer()
 	go RunWebServer()
 
@@ -129,12 +177,18 @@ func Main() {
 
 	// As websocket client already checks if the cloud token is set, we can start it here.
 	go RunWebsocketClient()
+	initPublicIPState()
 
 	initSerialPort()
+
+	setProcTitle("ready")
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	<-sigs
-	logger.Info().Msg("JetKVM Shutting Down")
+
+	logger.Log().Msg("JetKVM Shutting Down")
+
 	//if fuseServer != nil {
 	//	err := setMassStorageImage(" ")
 	//	if err != nil {

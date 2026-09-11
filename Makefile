@@ -2,13 +2,37 @@ BRANCH    := $(shell git rev-parse --abbrev-ref HEAD)
 BUILDDATE := $(shell date -u +%FT%T%z)
 BUILDTS   := $(shell date -u +%s)
 REVISION  := $(shell git rev-parse HEAD)
-VERSION_DEV := 0.4.9-dev$(shell date +%Y%m%d%H%M)
-VERSION := 0.4.8
+VERSION := 0.5.9
+VERSION_DEV := $(VERSION)-dev$(shell date -u +%Y%m%d%H%M)
+
+# SKUs the app binary must be published under in R2. The binary is currently
+# identical across SKUs but the cloud-api releases endpoint resolves
+# artifacts per SKU (app/<version>/skus/<sku>/jetkvm_app). Keep in sync with
+# KNOWN_SKUS in cloud-api/scripts/sync-releases.ts.
+APP_SKUS := jetkvm-v2 jetkvm-v2-sdmmc
 
 PROMETHEUS_TAG := github.com/prometheus/common/version
 KVM_PKG_NAME := github.com/jetkvm/kvm
 
-GO_BUILD_ARGS := -tags netgo -tags timetzdata
+BUILDKIT_FLAVOR := arm-rockchip830-linux-uclibcgnueabihf
+BUILDKIT_PATH ?= /opt/jetkvm-native-buildkit
+DOCKER_BUILD_TAG ?= ghcr.io/jetkvm/buildkit:latest
+SKIP_NATIVE_IF_EXISTS ?= 0
+SKIP_UI_BUILD ?= 0
+ENABLE_SYNC_TRACE ?= 0
+
+CMAKE_BUILD_TYPE ?= Release
+
+# GPG signing configuration
+# SIGNING_KEY_FPR: The fingerprint of the signing subkey (on YubiKey)
+# Required for signing releases
+SIGNING_KEY_FPR ?=
+
+GO_BUILD_ARGS := -tags netgo,timetzdata,nomsgpack
+ifeq ($(ENABLE_SYNC_TRACE), 1)
+	GO_BUILD_ARGS := $(GO_BUILD_ARGS),synctrace
+endif
+
 GO_RELEASE_BUILD_ARGS := -trimpath $(GO_BUILD_ARGS)
 GO_LDFLAGS := \
   -s -w \
@@ -17,20 +41,150 @@ GO_LDFLAGS := \
   -X $(PROMETHEUS_TAG).Revision=$(REVISION) \
   -X $(KVM_PKG_NAME).builtTimestamp=$(BUILDTS)
 
-GO_CMD := GOOS=linux GOARCH=arm GOARM=7 go
+GO_ARGS := GOOS=linux GOARCH=arm GOARM=7 ARCHFLAGS="-arch arm"
+# if BUILDKIT_PATH exists, use buildkit to build
+ifneq ($(wildcard $(BUILDKIT_PATH)),)
+	GO_ARGS := $(GO_ARGS) \
+		CGO_CFLAGS="-I$(BUILDKIT_PATH)/$(BUILDKIT_FLAVOR)/include -I$(BUILDKIT_PATH)/$(BUILDKIT_FLAVOR)/sysroot/usr/include" \
+		CGO_LDFLAGS="-L$(BUILDKIT_PATH)/$(BUILDKIT_FLAVOR)/lib -L$(BUILDKIT_PATH)/$(BUILDKIT_FLAVOR)/sysroot/usr/lib -lrockit -lrockchip_mpp -lrga -lpthread -lm" \
+		CC="$(BUILDKIT_PATH)/bin/$(BUILDKIT_FLAVOR)-gcc" \
+		LD="$(BUILDKIT_PATH)/bin/$(BUILDKIT_FLAVOR)-ld" \
+		CGO_ENABLED=1
+	# GO_RELEASE_BUILD_ARGS := $(GO_RELEASE_BUILD_ARGS) -x -work
+endif
+
+GO_CMD := $(GO_ARGS) go
+
 BIN_DIR := $(shell pwd)/bin
 
 TEST_DIRS := $(shell find . -name "*_test.go" -type f -exec dirname {} \; | sort -u)
 
-hash_resource:
-	@shasum -a 256 resource/jetkvm_native | cut -d ' ' -f 1 > resource/jetkvm_native.sha256
+test:
+	go test ./...
 
-build_dev: hash_resource
-	@echo "Building..."
+# Fail fast if rclone cannot reach the R2 bucket.
+check_r2:
+	@command -v rclone >/dev/null 2>&1 || { echo "Error: rclone is not installed"; exit 1; }
+	@rclone lsf r2://jetkvm-update/ >/dev/null 2>&1 || { echo "Error: Cannot access R2 bucket. Check rclone configuration and credentials."; exit 1; }
+
+# Fail fast if the requested signing key is not available in local GPG keyring.
+check_signing_key:
+	@if [ -z "$(SIGNING_KEY_FPR)" ]; then \
+		echo "Error: SIGNING_KEY_FPR is required"; \
+		exit 1; \
+	fi
+	@gpg --list-secret-keys --with-colons $(SIGNING_KEY_FPR) >/dev/null 2>&1 || { \
+		echo "Error: Signing key $(SIGNING_KEY_FPR) not found in local GPG keyring"; \
+		exit 1; \
+	}
+
+# Common env vars for OTA Playwright tests.
+# Usage: cd ui && $(call OTA_ENV,<version>) npx playwright test --project=<name>
+OTA_ENV = JETKVM_URL=http://$(DEVICE_IP) \
+	BASELINE_BINARY_PATH=$(abspath bin/jetkvm_app_baseline) \
+	RELEASE_BINARY_PATH=$(abspath bin/jetkvm_app) \
+	TEST_UPDATE_VERSION=$(1) \
+	NODE_NO_WARNINGS=1
+
+# E2E tests - normal development lane (core tests + prerelease OTA, no signing key needed)
+test_e2e:
+	@if [ -z "$(DEVICE_IP)" ]; then \
+		echo "Error: DEVICE_IP is required"; \
+		echo "Usage: make test_e2e DEVICE_IP=<ip> [JETKVM_REMOTE_HOST=<host>]"; \
+		exit 1; \
+	fi
+	$(eval TEST_VERSION := $(VERSION)-dev$(shell date -u +%Y%m%d%H%M))
+	$(MAKE) frontend
+	$(MAKE) check
+	$(MAKE) build_dev VERSION_DEV=0.0.1-test-baseline SKIP_UI_BUILD=1
+	mv bin/jetkvm_app bin/jetkvm_app_baseline
+	$(MAKE) build_dev VERSION_DEV=$(TEST_VERSION) SKIP_UI_BUILD=1 SKIP_NATIVE_IF_EXISTS=1
+	cd ui && npx playwright install chromium
+	cd ui && $(call OTA_ENV,$(TEST_VERSION)) \
+		$(if $(JETKVM_REMOTE_HOST),JETKVM_REMOTE_HOST=$(JETKVM_REMOTE_HOST)) \
+		npx playwright test --project=ui --project=remote-agent --project=ota-prerelease-unsigned --project=ota-upgrade-from-stable --project=ota-upgrade-to-signed
+
+# Production release validation lane
+test_production_release:
+	@if [ -z "$(SIGNING_KEY_FPR)" ]; then \
+		echo "Error: SIGNING_KEY_FPR is required"; \
+		echo "Usage: make test_production_release DEVICE_IP=<ip> SIGNING_KEY_FPR=<fingerprint> JETKVM_REMOTE_HOST=<host>"; \
+		exit 1; \
+	fi
+	@if [ -z "$(DEVICE_IP)" ]; then \
+		echo "Error: DEVICE_IP is required"; \
+		echo "Usage: make test_production_release DEVICE_IP=<ip> SIGNING_KEY_FPR=<fingerprint> JETKVM_REMOTE_HOST=<host>"; \
+		exit 1; \
+	fi
+	@if [ -z "$(JETKVM_REMOTE_HOST)" ]; then \
+		echo "Error: JETKVM_REMOTE_HOST is required"; \
+		echo "Usage: make test_production_release DEVICE_IP=<ip> SIGNING_KEY_FPR=<fingerprint> JETKVM_REMOTE_HOST=<host>"; \
+		exit 1; \
+	fi
+	$(MAKE) check_signing_key SIGNING_KEY_FPR=$(SIGNING_KEY_FPR)
+	$(MAKE) frontend
+	$(MAKE) check
+	$(MAKE) build_dev VERSION_DEV=0.0.1-test-baseline
+	mv bin/jetkvm_app bin/jetkvm_app_baseline
+	$(MAKE) build_release VERSION=$(VERSION)
+	@echo "Signing release binary..."
+	@rm -f bin/jetkvm_app.sig
+	@attempt=1; \
+	while [ $$attempt -le 3 ]; do \
+		echo -n "Ready to sign with key $(SIGNING_KEY_FPR)? [y/N] " && read ans && [ "$$ans" = "y" ] || { echo "Signing cancelled."; exit 1; }; \
+		if gpg --yes --detach-sign --output bin/jetkvm_app.sig --local-user $(SIGNING_KEY_FPR) bin/jetkvm_app; then \
+			break; \
+		fi; \
+		rm -f bin/jetkvm_app.sig; \
+		if [ $$attempt -eq 3 ]; then \
+			echo "Error: GPG signing failed after 3 attempts"; \
+			exit 1; \
+		fi; \
+		echo "GPG signing failed (attempt $$attempt/3). Please retry."; \
+		attempt=$$((attempt + 1)); \
+	done
+	@if [ ! -f "bin/jetkvm_app.sig" ]; then \
+		echo "Error: Signature file not created"; exit 1; \
+	fi
+	cd ui && npx playwright install --with-deps chromium && cd ..
+	cd ui && $(call OTA_ENV,$(VERSION)) RELEASE_SIGNATURE_PATH=$(abspath bin/jetkvm_app.sig) \
+		JETKVM_REMOTE_HOST=$(JETKVM_REMOTE_HOST) \
+		npx playwright test
+
+lint:
+	go vet ./...
+
+check: lint test
+
+build_native:
+	@if [ "$(SKIP_NATIVE_IF_EXISTS)" = "1" ] && [ -f "internal/native/cgo/lib/libjknative.a" ]; then \
+		echo "libjknative.a already exists, skipping native build..."; \
+	else \
+		echo "Building native..."; \
+			CC="$(BUILDKIT_PATH)/bin/$(BUILDKIT_FLAVOR)-gcc" \
+			LD="$(BUILDKIT_PATH)/bin/$(BUILDKIT_FLAVOR)-ld" \
+			CMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
+			./scripts/build_cgo.sh; \
+	fi
+
+build_dev:
+	@if [ ! -d "$(BUILDKIT_PATH)" ]; then \
+		echo "Toolchain not found, running build_dev in Docker..."; \
+		rm -rf internal/native/cgo/build; \
+		docker run --rm -v "$$(pwd):/build" \
+			-v go-mod-cache:/root/go/pkg/mod \
+			-v go-build-cache:/root/.cache/go-build \
+			$(DOCKER_BUILD_TAG) make _build_dev_inner VERSION_DEV=$(VERSION_DEV) SKIP_NATIVE_IF_EXISTS=$(SKIP_NATIVE_IF_EXISTS); \
+	else \
+		$(MAKE) _build_dev_inner VERSION_DEV=$(VERSION_DEV) SKIP_NATIVE_IF_EXISTS=$(SKIP_NATIVE_IF_EXISTS); \
+	fi
+
+_build_dev_inner: build_native
+	@echo "Building... $(VERSION_DEV)"
 	$(GO_CMD) build \
 		-ldflags="$(GO_LDFLAGS) -X $(KVM_PKG_NAME).builtAppVersion=$(VERSION_DEV)" \
 		$(GO_RELEASE_BUILD_ARGS) \
-		-o $(BIN_DIR)/jetkvm_app cmd/main.go
+		-o $(BIN_DIR)/jetkvm_app -v cmd/main.go
 
 build_test2json:
 	$(GO_CMD) build -o $(BIN_DIR)/test2json cmd/test2json
@@ -62,43 +216,216 @@ build_dev_test: build_test2json build_gotestsum
 	tar czfv device-tests.tar.gz -C $(BIN_DIR)/tests .
 
 frontend:
-	cd ui && npm ci && npm run build:device && \
-	find ../static/ \
-		-type f \
-		\( -name '*.js' \
-		-o -name '*.css' \
-		-o -name '*.html' \
-		-o -name '*.ico' \
-		-o -name '*.png' \
-		-o -name '*.jpg' \
-		-o -name '*.jpeg' \
-		-o -name '*.gif' \
-		-o -name '*.svg' \
-		-o -name '*.webp' \
-		-o -name '*.woff2' \
-		\) \
-		-exec sh -c 'gzip -9 -kfv {}' \;
+	@if [ "$(SKIP_UI_BUILD)" = "1" ] && [ -f "static/index.html" ]; then \
+		echo "Skipping frontend build..."; \
+	else \
+		cd ui && npm ci && npm run build:device && \
+		find ../static/ -type f \
+			\( -name '*.js' \
+			-o -name '*.css' \
+			-o -name '*.svg' \
+			\) -exec sh -c 'gzip -9 -fv {}' \; ;\
+	fi
 
-dev_release: frontend build_dev
-	@echo "Uploading release... $(VERSION_DEV)"
+git_check_dev:
+	@if [ "$$(git rev-parse --abbrev-ref HEAD)" != "dev" ]; then \
+		echo "Error: Must be on 'dev' branch"; exit 1; \
+	fi
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Error: Working tree is dirty. Commit or stash changes."; exit 1; \
+	fi
+	@git fetch origin dev
+	@if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/dev)" ]; then \
+		echo "Error: Local dev is not up-to-date with origin/dev"; exit 1; \
+	fi
+	@command -v gh >/dev/null 2>&1 || { echo "Error: gh CLI not installed"; exit 1; }
+	@gh auth status >/dev/null 2>&1 || { echo "Error: gh CLI not authenticated. Run 'gh auth login'"; exit 1; }
+
+dev_release: git_check_dev check_r2
+	@if [ -z "$(DEVICE_IP)" ]; then \
+		echo "Error: DEVICE_IP is required"; \
+		echo "Usage: make dev_release DEVICE_IP=<ip> JETKVM_REMOTE_HOST=<host>"; \
+		exit 1; \
+	fi
+	@if [ -z "$(JETKVM_REMOTE_HOST)" ]; then \
+		echo "Error: JETKVM_REMOTE_HOST is required"; \
+		echo "Usage: make dev_release DEVICE_IP=<ip> JETKVM_REMOTE_HOST=<host>"; \
+		exit 1; \
+	fi
+	@echo "═══════════════════════════════════════════════════════"
+	@echo "  DEV Release"
+	@echo "═══════════════════════════════════════════════════════"
+	@echo "  Version:    $(VERSION_DEV)"
+	@echo "  Tag:        release/$(VERSION_DEV)"
+	@echo "  Branch:     $$(git rev-parse --abbrev-ref HEAD)"
+	@echo "  Commit:     $$(git rev-parse --short HEAD)"
+	@echo "  Time:       $$(date -u +%FT%T%z)"
+	@echo "  Device:     $(DEVICE_IP)"
+	@echo "  Remote:     $(JETKVM_REMOTE_HOST)"
+	@echo "  Signing:    disabled for dev releases"
+	@echo "═══════════════════════════════════════════════════════"
+	@read -p "Proceed? [y/N] " confirm && [ "$$confirm" = "y" ] || exit 1
+	$(MAKE) check frontend
+	$(MAKE) build_dev VERSION_DEV=0.0.1-test-baseline SKIP_UI_BUILD=1
+	mv bin/jetkvm_app bin/jetkvm_app_baseline
+	$(MAKE) build_dev VERSION_DEV=$(VERSION_DEV) SKIP_UI_BUILD=1 SKIP_NATIVE_IF_EXISTS=1
+	@echo "Running mandatory dev release validation..."
+	cd ui && npx playwright install --with-deps chromium
+	cd ui && $(call OTA_ENV,$(VERSION_DEV)) \
+		JETKVM_REMOTE_HOST=$(JETKVM_REMOTE_HOST) \
+		npx playwright test --project=ui --project=remote-agent --project=ota-prerelease-unsigned --project=ota-prerelease-rejected --project=ota-specific-version --project=ota-upgrade-from-stable --project=ota-upgrade-to-signed
+
+	@echo "───────────────────────────────────────────────────────"
+	@echo "  All tests completed. Everything is tested and ready for release."
+	@echo "  Version:   $(VERSION_DEV)"
 	@shasum -a 256 bin/jetkvm_app | cut -d ' ' -f 1 > bin/jetkvm_app.sha256
-	rclone copyto bin/jetkvm_app r2://jetkvm-update/app/$(VERSION_DEV)/jetkvm_app
-	rclone copyto bin/jetkvm_app.sha256 r2://jetkvm-update/app/$(VERSION_DEV)/jetkvm_app.sha256
+	@app_hash=$$(cat bin/jetkvm_app.sha256); \
+	echo ""; \
+	echo "═══════════════════════════════════════════════════════"; \
+	echo "  R2 Upload"; \
+	echo "═══════════════════════════════════════════════════════"; \
+	echo "  Destination: r2://jetkvm-update/app/$(VERSION_DEV)/skus/<sku>/"; \
+	echo "  SHA256:      $$app_hash"; \
+	echo "  Files to upload:"; \
+	for sku in $(APP_SKUS); do \
+		echo "    - $$sku"; \
+		echo "        bin/jetkvm_app        -> r2://jetkvm-update/app/$(VERSION_DEV)/skus/$$sku/jetkvm_app"; \
+		echo "        bin/jetkvm_app.sha256 -> r2://jetkvm-update/app/$(VERSION_DEV)/skus/$$sku/jetkvm_app.sha256"; \
+	done; \
+	echo "═══════════════════════════════════════════════════════"; \
+	echo ""
+	@read -p "The R2 upload is prepared. These are the files. Do you want to continue? [y/N] " final_confirm && [ "$$final_confirm" = "y" ] || exit 1
+	@echo "Uploading device app to R2 (skus: $(APP_SKUS))..."
+	@for sku in $(APP_SKUS); do \
+		echo "  -> $$sku"; \
+		rclone copyto bin/jetkvm_app r2://jetkvm-update/app/$(VERSION_DEV)/skus/$$sku/jetkvm_app || exit 1; \
+		rclone copyto bin/jetkvm_app.sha256 r2://jetkvm-update/app/$(VERSION_DEV)/skus/$$sku/jetkvm_app.sha256 || exit 1; \
+	done
+	./scripts/deploy_cloud_app.sh -v $(VERSION_DEV) --skip-confirmation
+	@git tag release/$(VERSION_DEV)
+	@git push origin release/$(VERSION_DEV)
+	gh release create release/$(VERSION_DEV) bin/jetkvm_app bin/jetkvm_app.sha256 --prerelease --generate-notes
+	@echo "✓ Released: release/$(VERSION_DEV)"
 
-build_release: frontend hash_resource
+# NOTE: VERSION is passed explicitly for consistency with build_dev (see comment above).
+# While VERSION is static, passing it explicitly ensures the pattern is consistent
+# and prevents issues if VERSION ever becomes dynamic.
+build_release:
+	@if [ ! -d "$(BUILDKIT_PATH)" ]; then \
+		echo "Toolchain not found, running build_release in Docker..."; \
+		rm -rf internal/native/cgo/build; \
+		docker run --rm -v "$$(pwd):/build" \
+			-v go-mod-cache:/root/go/pkg/mod \
+			-v go-build-cache:/root/.cache/go-build \
+			$(DOCKER_BUILD_TAG) make _build_release_inner VERSION=$(VERSION) SKIP_NATIVE_IF_EXISTS=$(SKIP_NATIVE_IF_EXISTS); \
+	else \
+		$(MAKE) _build_release_inner VERSION=$(VERSION) SKIP_NATIVE_IF_EXISTS=$(SKIP_NATIVE_IF_EXISTS); \
+	fi
+
+_build_release_inner: build_native
 	@echo "Building release..."
 	$(GO_CMD) build \
 		-ldflags="$(GO_LDFLAGS) -X $(KVM_PKG_NAME).builtAppVersion=$(VERSION)" \
 		$(GO_RELEASE_BUILD_ARGS) \
-		-o bin/jetkvm_app cmd/main.go
+		-o $(BIN_DIR)/jetkvm_app cmd/main.go
 
-release:
-	@if rclone lsf r2://jetkvm-update/app/$(VERSION)/ | grep -q "jetkvm_app"; then \
-		echo "Error: Version $(VERSION) already exists. Please update the VERSION variable."; \
+release: git_check_dev check_r2
+	@if [ -z "$(SIGNING_KEY_FPR)" ]; then \
+		echo "Error: SIGNING_KEY_FPR is required for releases"; \
+		echo "Usage: make release DEVICE_IP=<ip> SIGNING_KEY_FPR=<fingerprint> JETKVM_REMOTE_HOST=<host>"; \
 		exit 1; \
 	fi
-	make build_release
-	@echo "Uploading release..."
+	@if [ -z "$(DEVICE_IP)" ]; then \
+		echo "Error: DEVICE_IP is required"; \
+		echo "Usage: make release DEVICE_IP=<ip> SIGNING_KEY_FPR=<fingerprint> JETKVM_REMOTE_HOST=<host>"; \
+		exit 1; \
+	fi
+	@if [ -z "$(JETKVM_REMOTE_HOST)" ]; then \
+		echo "Error: JETKVM_REMOTE_HOST is required"; \
+		echo "Usage: make release DEVICE_IP=<ip> SIGNING_KEY_FPR=<fingerprint> JETKVM_REMOTE_HOST=<host>"; \
+		exit 1; \
+	fi
+	$(MAKE) check_signing_key SIGNING_KEY_FPR=$(SIGNING_KEY_FPR)
+	@if rclone lsf r2://jetkvm-update/app/$(VERSION)/ 2>/dev/null | grep -q .; then \
+		echo "Error: Version $(VERSION) already exists in R2"; exit 1; \
+	fi
+	@latest_dev=$$(curl -s "https://api.jetkvm.com/releases?deviceId=123&prerelease=true" | jq -r '.appVersion // ""'); \
+		if ! echo "$$latest_dev" | grep -q "^$(VERSION)-dev"; then \
+			echo ""; \
+			echo "⚠️  Warning: No dev release found for $(VERSION)"; \
+			echo "   Latest pre-release: $$latest_dev"; \
+			echo ""; \
+			read -p "Release production without prior dev release? [y/N] " confirm && [ "$$confirm" = "y" ] || exit 1; \
+		fi
+	@echo "═══════════════════════════════════════════════════════"
+	@echo "  PRODUCTION Release"
+	@echo "═══════════════════════════════════════════════════════"
+	@echo "  Version: $(VERSION)"
+	@echo "  Tag:     release/$(VERSION)"
+	@echo "  Branch:  $$(git rev-parse --abbrev-ref HEAD)"
+	@echo "  Commit:  $$(git rev-parse --short HEAD)"
+	@echo "  Time:    $$(date -u +%FT%T%z)"
+	@echo "  Signing: $(SIGNING_KEY_FPR)"
+	@echo "  Remote:  $(JETKVM_REMOTE_HOST)"
+	@echo "═══════════════════════════════════════════════════════"
+	@read -p "Proceed with PRODUCTION release? [y/N] " confirm && [ "$$confirm" = "y" ] || exit 1
+	@echo "Running mandatory production validation..."
+	$(MAKE) test_production_release DEVICE_IP=$(DEVICE_IP) SIGNING_KEY_FPR=$(SIGNING_KEY_FPR) JETKVM_REMOTE_HOST=$(JETKVM_REMOTE_HOST)
+	@echo "───────────────────────────────────────────────────────"
+	@echo "  All tests completed. Everything is tested and ready for release."
+	@echo "  Version:   $(VERSION)"
 	@shasum -a 256 bin/jetkvm_app | cut -d ' ' -f 1 > bin/jetkvm_app.sha256
-	rclone copyto bin/jetkvm_app r2://jetkvm-update/app/$(VERSION)/jetkvm_app
-	rclone copyto bin/jetkvm_app.sha256 r2://jetkvm-update/app/$(VERSION)/jetkvm_app.sha256
+	@app_hash=$$(cat bin/jetkvm_app.sha256); \
+	echo ""; \
+	echo "═══════════════════════════════════════════════════════"; \
+	echo "  R2 Upload (PRODUCTION, signed)"; \
+	echo "═══════════════════════════════════════════════════════"; \
+	echo "  Destination: r2://jetkvm-update/app/$(VERSION)/skus/<sku>/"; \
+	echo "  SHA256:      $$app_hash"; \
+	echo "  Signing key: $(SIGNING_KEY_FPR)"; \
+	echo "  Files to upload:"; \
+	for sku in $(APP_SKUS); do \
+		echo "    - $$sku"; \
+		echo "        bin/jetkvm_app        -> r2://jetkvm-update/app/$(VERSION)/skus/$$sku/jetkvm_app"; \
+		echo "        bin/jetkvm_app.sha256 -> r2://jetkvm-update/app/$(VERSION)/skus/$$sku/jetkvm_app.sha256"; \
+		echo "        bin/jetkvm_app.sig    -> r2://jetkvm-update/app/$(VERSION)/skus/$$sku/jetkvm_app.sig"; \
+	done; \
+	echo "═══════════════════════════════════════════════════════"; \
+	echo ""
+	@read -p "The R2 upload is prepared. These are the files. Do you want to continue? [y/N] " final_confirm && [ "$$final_confirm" = "y" ] || exit 1
+
+	@echo "Uploading device app to R2 (skus: $(APP_SKUS))..."
+	@for sku in $(APP_SKUS); do \
+		echo "  -> $$sku"; \
+		rclone copyto bin/jetkvm_app r2://jetkvm-update/app/$(VERSION)/skus/$$sku/jetkvm_app || exit 1; \
+		rclone copyto bin/jetkvm_app.sha256 r2://jetkvm-update/app/$(VERSION)/skus/$$sku/jetkvm_app.sha256 || exit 1; \
+		rclone copyto bin/jetkvm_app.sig r2://jetkvm-update/app/$(VERSION)/skus/$$sku/jetkvm_app.sig || exit 1; \
+	done
+	./scripts/deploy_cloud_app.sh -v $(VERSION) --set-as-default --skip-confirmation
+	@git tag release/$(VERSION)
+	@git push origin release/$(VERSION)
+	prev_prod=$$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName'); \
+	gh release create release/$(VERSION) bin/jetkvm_app bin/jetkvm_app.sha256 bin/jetkvm_app.sig \
+		--title "$(VERSION)" \
+		--generate-notes \
+		--notes-start-tag "$$prev_prod" \
+		--draft
+	@echo ""
+	@echo "✓ Released: release/$(VERSION)"
+	@echo ""
+	@echo "Next: Run 'make bump-version' to prepare for next release cycle"
+
+bump-version:
+	@next_default=$$(echo $(VERSION) | awk -F. '{print $$1"."$$2"."$$3+1}'); \
+		echo "Current version: $(VERSION)"; \
+		read -p "Next version [$$next_default]: " next_ver; \
+		next_ver=$${next_ver:-$$next_default}; \
+		if ! echo "$$next_ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+			echo "Error: Invalid version '$$next_ver'. Must be semver format (e.g., 1.2.3)"; \
+			exit 1; \
+		fi; \
+		sed -i 's/^VERSION := .*/VERSION := '"$$next_ver"'/' Makefile && \
+		git add Makefile && \
+		git commit -m "Bump version to $$next_ver" && \
+		git push && \
+		echo "✓ Bumped to $$next_ver"

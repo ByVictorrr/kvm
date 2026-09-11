@@ -36,9 +36,11 @@ func (w *logOutput) Write(p []byte) (n int, err error) {
 
 	// TODO: write to file or syslog
 	if sseServer != nil {
+		// The caller may reuse p as soon as Write returns.
+		message := string(p)
 		// use a goroutine to avoid blocking the Write method
 		go func() {
-			sseServer.Message <- string(p)
+			sseServer.Message <- message
 		}()
 	}
 	return len(p), nil
@@ -73,6 +75,13 @@ var (
 		"INFO":    zerolog.InfoLevel,
 		"DEBUG":   zerolog.DebugLevel,
 		"TRACE":   zerolog.TraceLevel,
+	}
+
+	// subsystemDefaultLevels defines default log levels for specific subsystems
+	// that should always log at a certain level regardless of the global default.
+	subsystemDefaultLevels = map[string]zerolog.Level{
+		"diagnostics": zerolog.InfoLevel,
+		"supervisor":  zerolog.InfoLevel,
 	}
 )
 
@@ -135,12 +144,20 @@ func (l *Logger) getScopeLoggerLevel(scope string) zerolog.Level {
 		l.updateLogLevel()
 	}
 
-	var scopeLevel zerolog.Level
+	scopeLevel := l.defaultLogLevel
 	if l.defaultLogLevelFromConfig != -2 {
 		scopeLevel = l.defaultLogLevelFromConfig
 	}
 	if l.defaultLogLevelFromEnv != -2 {
 		scopeLevel = l.defaultLogLevelFromEnv
+	}
+
+	// Check if this subsystem has a specific default level
+	if subsystemLevel, ok := subsystemDefaultLevels[scope]; ok {
+		// Use the more verbose level (lower value = more verbose)
+		if subsystemLevel < scopeLevel {
+			scopeLevel = subsystemLevel
+		}
 	}
 
 	// if the scope is not in the map, use the default level from the root logger
@@ -173,13 +190,12 @@ func (l *Logger) UpdateLogLevel(configDefaultLogLevel string) {
 
 	if configDefaultLogLevel != "" {
 		if logLevel, ok := zerologLevels[configDefaultLogLevel]; ok {
+			if l.defaultLogLevelFromConfig != logLevel {
+				needUpdate = true
+			}
 			l.defaultLogLevelFromConfig = logLevel
 		} else {
 			l.l.Warn().Str("logLevel", configDefaultLogLevel).Msg("invalid defaultLogLevel from config, using ERROR")
-		}
-
-		if l.defaultLogLevelFromConfig != l.defaultLogLevel {
-			needUpdate = true
 		}
 	}
 
