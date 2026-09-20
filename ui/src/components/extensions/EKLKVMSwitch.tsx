@@ -5,9 +5,8 @@ import Card from "@components/Card";
 import { SettingsPageHeader } from "@components/SettingsPageheader";
 import notifications from "@/notifications";
 import { cx } from "@/cva.config";
-import useKeyboard, { MacroSteps } from "@/hooks/useKeyboard";
+import { useHidRpc } from "@/hooks/useHidRpc";
 
-// Edit these labels to match your actual servers.
 const EKL_SERVER_NAMES = [
   "Server 1",
   "Server 2",
@@ -19,34 +18,52 @@ const EKL_SERVER_NAMES = [
   "Server 8",
 ];
 
-// eKL 81HK hotkey: Scroll Lock, Scroll Lock, Digit[N]
-function buildHotkeySteps(input: number): MacroSteps {
-  return [
-    { keys: ["ScrollLock"], modifiers: null, delay: 100 },
-    { keys: ["ScrollLock"], modifiers: null, delay: 100 },
-    { keys: [`Digit${input}`], modifiers: null, delay: 100 },
-  ];
-}
+// HID keycodes
+const SCROLL_LOCK = 0x47;
+const DIGIT_KEYS = [0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25]; // Digit1–8
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 interface EKLKVMSwitchProps {
-  /** When true the component renders in compact (toolbar-popover) mode. */
   compact?: boolean;
 }
 
 export function EKLKVMSwitch({ compact = false }: EKLKVMSwitchProps) {
   const [activeInput, setActiveInput] = useState<number | null>(null);
   const [pendingInput, setPendingInput] = useState<number | null>(null);
-  const { executeMacro } = useKeyboard();
+  const { reportKeypressEvent, rpcHidReady } = useHidRpc();
 
   const handleSwitch = async (input: number) => {
     if (pendingInput !== null) return;
     setPendingInput(input);
 
     try {
-      // Send hotkey sequence via HID keyboard emulation (works without serial hardware)
-      await executeMacro(buildHotkeySteps(input));
+      const portKey = DIGIT_KEYS[input - 1];
+      console.log(`[EKL] switching to input ${input} | rpcHidReady=${rpcHidReady} | portKey=0x${portKey.toString(16)}`);
 
-      // Also attempt serial switch — no-op until RS-232 hardware is connected
+      // ScrollLock #1
+      console.log("[EKL] ScrollLock press 1");
+      reportKeypressEvent(SCROLL_LOCK, true);
+      await sleep(50);
+      reportKeypressEvent(SCROLL_LOCK, false);
+      await sleep(80);
+
+      // ScrollLock #2 — KVM should enter control state and beep twice
+      console.log("[EKL] ScrollLock press 2");
+      reportKeypressEvent(SCROLL_LOCK, true);
+      await sleep(50);
+      reportKeypressEvent(SCROLL_LOCK, false);
+      await sleep(300); // give KVM time to enter control mode
+
+      // Port digit
+      console.log(`[EKL] Digit${input} press`);
+      reportKeypressEvent(portKey, true);
+      await sleep(50);
+      reportKeypressEvent(portKey, false);
+
+      console.log("[EKL] sequence complete");
+
+      // Also fire serial API — no-op until RS-232 hardware is wired
       fetch(`/api/ekl/input/${input}`, { method: "POST" }).catch(() => {});
 
       setActiveInput(input);
