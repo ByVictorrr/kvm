@@ -5,6 +5,7 @@ import Card from "@components/Card";
 import { SettingsPageHeader } from "@components/SettingsPageheader";
 import notifications from "@/notifications";
 import { cx } from "@/cva.config";
+import useKeyboard, { MacroSteps } from "@/hooks/useKeyboard";
 
 // Edit these labels to match your actual servers.
 const EKL_SERVER_NAMES = [
@@ -18,6 +19,15 @@ const EKL_SERVER_NAMES = [
   "Server 8",
 ];
 
+// eKL 81HK hotkey: Scroll Lock, Scroll Lock, Digit[N]
+function buildHotkeySteps(input: number): MacroSteps {
+  return [
+    { keys: ["ScrollLock"], modifiers: null, delay: 100 },
+    { keys: ["ScrollLock"], modifiers: null, delay: 100 },
+    { keys: [`Digit${input}`], modifiers: null, delay: 100 },
+  ];
+}
+
 interface EKLKVMSwitchProps {
   /** When true the component renders in compact (toolbar-popover) mode. */
   compact?: boolean;
@@ -26,18 +36,19 @@ interface EKLKVMSwitchProps {
 export function EKLKVMSwitch({ compact = false }: EKLKVMSwitchProps) {
   const [activeInput, setActiveInput] = useState<number | null>(null);
   const [pendingInput, setPendingInput] = useState<number | null>(null);
+  const { executeMacro } = useKeyboard();
 
   const handleSwitch = async (input: number) => {
     if (pendingInput !== null) return;
     setPendingInput(input);
 
     try {
-      const resp = await fetch(`/api/ekl/input/${input}`, { method: "POST" });
-      if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}));
-        notifications.error(`KVM switch failed: ${body.error ?? resp.statusText}`);
-        return;
-      }
+      // Send hotkey sequence via HID keyboard emulation (works without serial hardware)
+      await executeMacro(buildHotkeySteps(input));
+
+      // Also attempt serial switch — no-op until RS-232 hardware is connected
+      fetch(`/api/ekl/input/${input}`, { method: "POST" }).catch(() => {});
+
       setActiveInput(input);
     } catch (err) {
       notifications.error(`KVM switch failed: ${err}`);
