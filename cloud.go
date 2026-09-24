@@ -8,18 +8,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
 
+	"github.com/jetkvm/kvm/internal/sync"
+
+	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-
-	"github.com/coreos/go-oidc/v3/oidc"
-
-	"github.com/coder/websocket"
-	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
 )
 
@@ -156,6 +155,12 @@ var (
 	cloudDisconnectLock = &sync.Mutex{}
 )
 
+func getCloudConnectionState() CloudConnectionState {
+	cloudConnectionStateLock.Lock()
+	defer cloudConnectionStateLock.Unlock()
+	return cloudConnectionState
+}
+
 func setCloudConnectionState(state CloudConnectionState) {
 	cloudConnectionStateLock.Lock()
 	defer cloudConnectionStateLock.Unlock()
@@ -170,6 +175,7 @@ func setCloudConnectionState(state CloudConnectionState) {
 
 	go waitCtrlAndRequestDisplayUpdate(
 		previousState != state,
+		"set_cloud_connection_state",
 	)
 }
 
@@ -253,7 +259,8 @@ func handleCloudRegister(c *gin.Context) {
 
 	provider, err := oidc.NewProvider(c, "https://accounts.google.com")
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to initialize OIDC provider: " + err.Error()})
+		cloudLogger.Error().Err(err).Msg("failed to initialize OIDC provider")
+		c.JSON(500, gin.H{"error": "Failed to initialize OIDC provider"})
 		return
 	}
 
@@ -264,7 +271,8 @@ func handleCloudRegister(c *gin.Context) {
 	verifier := provider.Verifier(oidcConfig)
 	idToken, err := verifier.Verify(c, req.OidcGoogle)
 	if err != nil {
-		c.JSON(400, gin.H{"error": "Invalid OIDC token: " + err.Error()})
+		cloudLogger.Warn().Err(err).Msg("OIDC token verification failed")
+		c.JSON(400, gin.H{"error": "Invalid OIDC token"})
 		return
 	}
 
@@ -319,6 +327,7 @@ func runWebsocketClient() error {
 	header := http.Header{}
 	header.Set("X-Device-ID", GetDeviceID())
 	header.Set("X-App-Version", builtAppVersion)
+	header.Set("X-Device-SKU", GetDeviceSKU())
 	header.Set("Authorization", "Bearer "+config.CloudToken)
 	dialCtx, cancelDial := context.WithTimeout(context.Background(), CloudWebSocketConnectTimeout)
 
@@ -453,6 +462,7 @@ func handleSessionRequest(
 		LocalIP:    req.IP,
 		ICEServers: req.ICEServers,
 		Logger:     scopedLogger,
+		MDNSMode:   config.NetworkConfig.MDNSMode.String,
 	})
 	if err != nil {
 		_ = wsjson.Write(context.Background(), c, gin.H{"error": err})
@@ -466,6 +476,8 @@ func handleSessionRequest(
 	}
 	if currentSession != nil {
 		writeJSONRPCEvent("otherSessionConnected", nil, currentSession)
+		gadget.CancelAllAutoReleaseTimers()
+		_ = rpcKeyboardReport(0, keyboardClearStateKeys)
 		peerConn := currentSession.peerConnection
 		go func() {
 			time.Sleep(1 * time.Second)
@@ -493,7 +505,7 @@ func RunWebsocketClient() {
 		}
 
 		// If the network is not up, well, we can't connect to the cloud.
-		if !networkState.IsOnline() {
+		if !networkManager.IsOnline() {
 			cloudLogger.Warn().Msg("waiting for network to be online, will retry in 3 seconds")
 			time.Sleep(3 * time.Second)
 			continue

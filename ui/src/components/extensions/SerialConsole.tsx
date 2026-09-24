@@ -33,13 +33,24 @@ export function SerialConsole() {
         );
         return;
       }
-      setSettings(resp.result as SerialSettings);
+      const r = resp.result as { baudRate: number | string; dataBits: number | string; stopBits: string; parity: string };
+      setSettings({
+        baudRate: String(r.baudRate),
+        dataBits: String(r.dataBits),
+        stopBits: r.stopBits,
+        parity: r.parity,
+      });
     });
   }, [send]);
 
   const handleSettingChange = (setting: keyof SerialSettings, value: string) => {
     const newSettings = { ...settings, [setting]: value };
-    send("setSerialSettings", { settings: newSettings }, (resp: JsonRpcResponse) => {
+    const payload = {
+      ...newSettings,
+      baudRate: parseInt(newSettings.baudRate, 10),
+      dataBits: parseInt(newSettings.dataBits, 10),
+    };
+    send("setSerialSettings", { settings: payload }, (resp: JsonRpcResponse) => {
       if ("error" in resp) {
         notifications.error(
           `Failed to update serial settings: ${resp.error.data || "Unknown error"}`,

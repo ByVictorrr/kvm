@@ -3,6 +3,7 @@ package usbgadget
 import (
 	"fmt"
 	"os"
+	"time"
 )
 
 var absoluteMouseConfig = gadgetConfigItem{
@@ -15,6 +16,7 @@ var absoluteMouseConfig = gadgetConfigItem{
 		"subclass":        "0",
 		"report_length":   "6",
 		"no_out_endpoint": "1",
+		"wakeup_on_write": "0",
 	},
 	reportDesc: absoluteMouseCombinedReportDesc,
 }
@@ -30,14 +32,14 @@ var absoluteMouseCombinedReportDesc = []byte{
 	0xA1, 0x00, //     Collection (Physical)
 	0x05, 0x09, //         Usage Page (Button)
 	0x19, 0x01, //         Usage Minimum (0x01)
-	0x29, 0x03, //         Usage Maximum (0x03)
+	0x29, 0x05, //         Usage Maximum (0x05)
 	0x15, 0x00, //         Logical Minimum (0)
 	0x25, 0x01, //         Logical Maximum (1)
 	0x75, 0x01, //         Report Size (1)
-	0x95, 0x03, //         Report Count (3)
+	0x95, 0x05, //         Report Count (5)
 	0x81, 0x02, //         Input (Data, Var, Abs)
 	0x95, 0x01, //         Report Count (1)
-	0x75, 0x05, //         Report Size (5)
+	0x75, 0x03, //         Report Size (3)
 	0x81, 0x03, //         Input (Cnst, Var, Abs)
 	0x05, 0x01, //         Usage Page (Generic Desktop Ctrls)
 	0x09, 0x30, //         Usage (X)
@@ -61,6 +63,13 @@ var absoluteMouseCombinedReportDesc = []byte{
 	0x75, 0x08, //     Report Size (8)
 	0x95, 0x01, //     Report Count (1)
 	0x81, 0x06, //     Input (Data, Var, Rel)
+	0x05, 0x0C, //     Usage Page (Consumer)
+	0x0A, 0x38, 0x02, // Usage (AC Pan)
+	0x15, 0x81, //     Logical Minimum (-127)
+	0x25, 0x7F, //     Logical Maximum (127)
+	0x75, 0x08, //     Report Size (8)
+	0x95, 0x01, //     Report Count (1)
+	0x81, 0x06, //     Input (Data, Var, Rel)
 
 	0xC0, // End Collection
 }
@@ -68,7 +77,7 @@ var absoluteMouseCombinedReportDesc = []byte{
 func (u *UsbGadget) absMouseWriteHidFile(data []byte) error {
 	if u.absMouseHidFile == nil {
 		var err error
-		u.absMouseHidFile, err = os.OpenFile("/dev/hidg1", os.O_RDWR, 0666)
+		u.absMouseHidFile, err = u.openWithTimeout("/dev/hidg1", os.O_RDWR, 0666, 3*time.Second)
 		if err != nil {
 			return fmt.Errorf("failed to open hidg1: %w", err)
 		}
@@ -85,7 +94,18 @@ func (u *UsbGadget) absMouseWriteHidFile(data []byte) error {
 	return nil
 }
 
+func (u *UsbGadget) HasAbsoluteMouse() bool {
+	return u.enabledDevices.AbsoluteMouse
+}
+
 func (u *UsbGadget) AbsMouseReport(x int, y int, buttons uint8) error {
+	u.hidLifecycle.RLock()
+	defer u.hidLifecycle.RUnlock()
+
+	if !u.enabledDevices.AbsoluteMouse {
+		return nil
+	}
+
 	u.absMouseLock.Lock()
 	defer u.absMouseLock.Unlock()
 
@@ -101,22 +121,37 @@ func (u *UsbGadget) AbsMouseReport(x int, y int, buttons uint8) error {
 		return err
 	}
 
+	if pressed := buttons != 0; pressed != u.absMousePressed {
+		u.absMousePressed = pressed
+		updateHidHandover(func(h *hidHandover) {
+			h.AbsPressed, h.AbsX, h.AbsY = pressed, x, y
+		})
+	}
+
 	u.resetUserInputTime()
 	return nil
 }
 
-func (u *UsbGadget) AbsMouseWheelReport(wheelY int8) error {
+func (u *UsbGadget) AbsMouseWheelReport(wheelY int8, wheelX int8) error {
+	u.hidLifecycle.RLock()
+	defer u.hidLifecycle.RUnlock()
+
+	if !u.enabledDevices.AbsoluteMouse {
+		return nil
+	}
+
 	u.absMouseLock.Lock()
 	defer u.absMouseLock.Unlock()
 
-	// Only send a report if the value is non-zero
-	if wheelY == 0 {
+	// Only send a report if at least one value is non-zero
+	if wheelY == 0 && wheelX == 0 {
 		return nil
 	}
 
 	err := u.absMouseWriteHidFile([]byte{
 		2,            // Report ID 2
 		byte(wheelY), // Wheel Y (signed)
+		byte(wheelX), // Wheel X / AC Pan (signed)
 	})
 
 	u.resetUserInputTime()

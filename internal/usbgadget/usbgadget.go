@@ -4,12 +4,14 @@ package usbgadget
 
 import (
 	"context"
+	"maps"
 	"os"
 	"path"
-	"sync"
 	"time"
 
 	"github.com/jetkvm/kvm/internal/logging"
+	"github.com/jetkvm/kvm/internal/sync"
+
 	"github.com/rs/zerolog"
 )
 
@@ -19,6 +21,8 @@ type Devices struct {
 	RelativeMouse bool `json:"relative_mouse"`
 	Keyboard      bool `json:"keyboard"`
 	MassStorage   bool `json:"mass_storage"`
+	SerialConsole bool `json:"serial_console"`
+	Audio         bool `json:"audio"`
 }
 
 // Config is a struct that represents the customizations for a USB gadget.
@@ -39,6 +43,7 @@ var defaultUsbGadgetDevices = Devices{
 	RelativeMouse: true,
 	Keyboard:      true,
 	MassStorage:   true,
+	Audio:         false,
 }
 
 type KeysDownState struct {
@@ -58,10 +63,22 @@ type UsbGadget struct {
 
 	configLock sync.Mutex
 
+	// Descriptor lock order: configLock (rebind only), keyboardMutex (keyboard
+	// reports only), hidLifecycle, then the per-device file lock. Never nest
+	// lifecycle read locks or hold one across the blocking LED Read. Rebind
+	// takes no keyboardMutex, so admitted keyboard work can finish first.
+	hidLifecycle sync.RWMutex
+	hidOpens     hidOpenTracker
+	// nil uses os.OpenFile; overridden by lifecycle tests without device access.
+	hidOpenFile func(string, int, os.FileMode) (*os.File, error)
+
 	keyboardHidFile *os.File
 	keyboardLock    sync.Mutex
+	wakeHidFile     *os.File
+	wakeHidLock     sync.Mutex
 	absMouseHidFile *os.File
 	absMouseLock    sync.Mutex
+	absMousePressed bool
 	relMouseHidFile *os.File
 	relMouseLock    sync.Mutex
 
@@ -88,12 +105,14 @@ type UsbGadget struct {
 
 	onKeyboardStateChange *func(state KeyboardState)
 	onKeysDownChange      *func(state KeysDownState)
-	onKeepAliveReset      *func()
 
 	log *zerolog.Logger
 
 	logSuppressionCounter map[string]int
 	logSuppressionLock    sync.Mutex
+
+	hidWriteTimeoutStreaks map[string]int
+	hidWriteStreakLock     sync.Mutex
 }
 
 const configFSPath = "/sys/kernel/config"
@@ -125,10 +144,11 @@ func newUsbGadget(name string, configMap map[string]gadgetConfigItem, enabledDev
 		name:                 name,
 		kvmGadgetPath:        path.Join(gadgetPath, name),
 		configC1Path:         path.Join(gadgetPath, name, "configs/c.1"),
-		configMap:            configMap,
+		configMap:            deepCopyConfigMap(configMap),
 		customConfig:         *config,
 		configLock:           sync.Mutex{},
 		keyboardLock:         sync.Mutex{},
+		wakeHidLock:          sync.Mutex{},
 		absMouseLock:         sync.Mutex{},
 		relMouseLock:         sync.Mutex{},
 		txLock:               sync.Mutex{},
@@ -155,6 +175,16 @@ func newUsbGadget(name string, configMap map[string]gadgetConfigItem, enabledDev
 	return g
 }
 
+func deepCopyConfigMap(configMap map[string]gadgetConfigItem) map[string]gadgetConfigItem {
+	copied := make(map[string]gadgetConfigItem, len(configMap))
+	for key, item := range configMap {
+		item.attrs = maps.Clone(item.attrs)
+		item.configAttrs = maps.Clone(item.configAttrs)
+		copied[key] = item
+	}
+	return copied
+}
+
 // Close cleans up resources used by the USB gadget
 func (u *UsbGadget) Close() error {
 	// Cancel keyboard state context
@@ -177,6 +207,10 @@ func (u *UsbGadget) Close() error {
 		u.keyboardHidFile.Close()
 		u.keyboardHidFile = nil
 	}
+	if u.wakeHidFile != nil {
+		u.wakeHidFile.Close()
+		u.wakeHidFile = nil
+	}
 	if u.absMouseHidFile != nil {
 		u.absMouseHidFile.Close()
 		u.absMouseHidFile = nil
@@ -187,4 +221,33 @@ func (u *UsbGadget) Close() error {
 	}
 
 	return nil
+}
+
+// ResetHIDFiles closes all open HID gadget file descriptors.
+// After a UDC rebind, previously open /dev/hidg* handles may point to a stale
+// transport endpoint and must be reopened before use.
+func (u *UsbGadget) ResetHIDFiles() {
+	u.keyboardLock.Lock()
+	u.closeKeyboardHidFileLocked()
+	unlockWithLog(&u.keyboardLock, u.log, "keyboardHidFile reset")
+
+	u.wakeHidLock.Lock()
+	u.closeWakeHidFileLocked()
+	unlockWithLog(&u.wakeHidLock, u.log, "wakeHidFile reset")
+
+	u.absMouseLock.Lock()
+	if u.absMouseHidFile != nil {
+		u.absMouseHidFile.Close()
+		u.absMouseHidFile = nil
+	}
+	unlockWithLog(&u.absMouseLock, u.log, "absMouseHidFile reset")
+
+	u.relMouseLock.Lock()
+	if u.relMouseHidFile != nil {
+		u.relMouseHidFile.Close()
+		u.relMouseHidFile = nil
+	}
+	unlockWithLog(&u.relMouseLock, u.log, "relMouseHidFile reset")
+
+	u.clearHidWriteTimeoutStreaks()
 }

@@ -3,10 +3,13 @@ package kvm
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/jetkvm/kvm/internal/ota"
+	"github.com/jetkvm/kvm/internal/sync"
 )
 
 func extractSerialNumber() (string, error) {
@@ -28,12 +31,37 @@ func extractSerialNumber() (string, error) {
 	return matches[1], nil
 }
 
-func readOtpEntropy() ([]byte, error) { //nolint:unused
-	content, err := os.ReadFile("/sys/bus/nvmem/devices/rockchip-otp0/nvmem")
-	if err != nil {
-		return nil, err
+func hwReboot(force bool, postRebootAction *ota.PostRebootAction, delay time.Duration) error {
+	logger.Info().Dur("delayMs", delay).Msg("reboot requested")
+
+	writeJSONRPCEvent("willReboot", postRebootAction, currentSession)
+	time.Sleep(1 * time.Second) // Wait for the JSONRPCEvent to be sent
+
+	nativeInstance.SwitchToScreenIfDifferent("rebooting_screen")
+	if delay > 1*time.Second {
+		time.Sleep(delay - 1*time.Second) // wait requested extra settle time
 	}
-	return content[0x17:0x1C], nil
+
+	args := []string{}
+	if force {
+		args = append(args, "-f")
+	}
+
+	cmd := exec.Command("reboot", args...)
+	err := cmd.Start()
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to reboot")
+		switchToMainScreen()
+		return fmt.Errorf("failed to reboot: %w", err)
+	}
+
+	// If the reboot command is successful, exit the program after 5 seconds
+	go func() {
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	}()
+
+	return nil
 }
 
 var deviceID string
@@ -50,6 +78,21 @@ func GetDeviceID() string {
 		}
 	})
 	return deviceID
+}
+
+var deviceSKU string
+var deviceSKUOnce sync.Once
+
+func GetDeviceSKU() string {
+	deviceSKUOnce.Do(func() {
+		content, err := os.ReadFile("/etc/jetkvm-sku")
+		if err != nil || strings.TrimSpace(string(content)) == "" {
+			deviceSKU = "jetkvm-v2"
+		} else {
+			deviceSKU = strings.TrimSpace(string(content))
+		}
+	})
+	return deviceSKU
 }
 
 func GetDefaultHostname() string {

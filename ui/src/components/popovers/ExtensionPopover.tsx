@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { LuPower, LuTerminal, LuPlugZap } from "react-icons/lu";
+import { LuPower, LuTerminal, LuPlugZap, LuMonitor } from "react-icons/lu";
 
 import { JsonRpcResponse, useJsonRpc } from "@/hooks/useJsonRpc";
 import Card, { GridCard } from "@components/Card";
@@ -7,6 +7,7 @@ import { SettingsPageHeader } from "@components/SettingsPageheader";
 import { ATXPowerControl } from "@components/extensions/ATXPowerControl";
 import { DCPowerControl } from "@components/extensions/DCPowerControl";
 import { SerialConsole } from "@components/extensions/SerialConsole";
+import { EKLKVMSwitch } from "@components/extensions/EKLKVMSwitch";
 import { Button } from "@components/Button";
 import notifications from "@/notifications";
 
@@ -35,6 +36,12 @@ const AVAILABLE_EXTENSIONS: Extension[] = [
     name: "Serial Console",
     description: "Access your serial console extension",
     icon: LuTerminal,
+  },
+  {
+    id: "ekl-kvm",
+    name: "eKL KVM Switch",
+    description: "Switch the eKL 81HK 8-port HDMI KVM via RS-232",
+    icon: LuMonitor,
   },
 ];
 
@@ -76,6 +83,8 @@ export default function ExtensionPopover() {
         return <DCPowerControl />;
       case "serial-console":
         return <SerialConsole />;
+      case "ekl-kvm":
+        return <EKLKVMSwitch />;
       default:
         return null;
     }
@@ -120,13 +129,16 @@ export default function ExtensionPopover() {
                         key={extension.id}
                         className="flex items-center justify-between p-3"
                       >
-                        <div className="space-y-0.5">
-                          <p className="text-sm font-semibold leading-none text-slate-900 dark:text-slate-100">
-                            {extension.name}
-                          </p>
-                          <p className="text-sm text-slate-600 dark:text-slate-400">
-                            {extension.description}
-                          </p>
+                        <div className="flex items-center gap-3">
+                          <extension.icon className="h-5 w-5 shrink-0 text-slate-500 dark:text-slate-400" />
+                          <div className="space-y-0.5">
+                            <p className="text-sm font-semibold leading-none text-slate-900 dark:text-slate-100">
+                              {extension.name}
+                            </p>
+                            <p className="text-sm text-slate-600 dark:text-slate-400">
+                              {extension.description}
+                            </p>
+                          </div>
                         </div>
                         <Button
                           size="XS"

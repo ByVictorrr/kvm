@@ -3,19 +3,30 @@ package kvm
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
-	"sync"
+	"strconv"
+	"strings"
 
+	"github.com/jetkvm/kvm/internal/confparser"
 	"github.com/jetkvm/kvm/internal/logging"
-	"github.com/jetkvm/kvm/internal/network"
+	"github.com/jetkvm/kvm/internal/native"
+	"github.com/jetkvm/kvm/internal/network/types"
+	"github.com/jetkvm/kvm/internal/sync"
 	"github.com/jetkvm/kvm/internal/usbgadget"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+const (
+	DefaultAPIURL = "https://api.jetkvm.com"
+)
+
 type WakeOnLanDevice struct {
-	Name       string `json:"name"`
-	MacAddress string `json:"macAddress"`
+	Name        string `json:"name"`
+	MacAddress  string `json:"macAddress"`
+	BroadcastIP string `json:"broadcastIP,omitempty"`
 }
 
 // Constants for keyboard macro limits
@@ -77,71 +88,135 @@ func (m *KeyboardMacro) Validate() error {
 }
 
 type Config struct {
-	CloudURL             string                 `json:"cloud_url"`
-	CloudAppURL          string                 `json:"cloud_app_url"`
-	CloudToken           string                 `json:"cloud_token"`
-	GoogleIdentity       string                 `json:"google_identity"`
-	JigglerEnabled       bool                   `json:"jiggler_enabled"`
-	JigglerConfig        *JigglerConfig         `json:"jiggler_config"`
-	AutoUpdateEnabled    bool                   `json:"auto_update_enabled"`
-	IncludePreRelease    bool                   `json:"include_pre_release"`
-	HashedPassword       string                 `json:"hashed_password"`
-	LocalAuthToken       string                 `json:"local_auth_token"`
-	LocalAuthMode        string                 `json:"localAuthMode"` //TODO: fix it with migration
-	LocalLoopbackOnly    bool                   `json:"local_loopback_only"`
-	WakeOnLanDevices     []WakeOnLanDevice      `json:"wake_on_lan_devices"`
-	KeyboardMacros       []KeyboardMacro        `json:"keyboard_macros"`
-	KeyboardLayout       string                 `json:"keyboard_layout"`
-	EdidString           string                 `json:"hdmi_edid_string"`
-	ActiveExtension      string                 `json:"active_extension"`
-	DisplayRotation      string                 `json:"display_rotation"`
-	DisplayMaxBrightness int                    `json:"display_max_brightness"`
-	DisplayDimAfterSec   int                    `json:"display_dim_after_sec"`
-	DisplayOffAfterSec   int                    `json:"display_off_after_sec"`
-	TLSMode              string                 `json:"tls_mode"` // options: "self-signed", "user-defined", ""
-	UsbConfig            *usbgadget.Config      `json:"usb_config"`
-	UsbDevices           *usbgadget.Devices     `json:"usb_devices"`
-	NetworkConfig        *network.NetworkConfig `json:"network_config"`
-	DefaultLogLevel      string                 `json:"default_log_level"`
+	CloudURL             string               `json:"cloud_url"`
+	UpdateAPIURL         string               `json:"update_api_url"`
+	CloudAppURL          string               `json:"cloud_app_url"`
+	CloudToken           string               `json:"cloud_token"`
+	TailscaleControlURL  string               `json:"tailscale_control_url,omitempty"`
+	GoogleIdentity       string               `json:"google_identity"`
+	JigglerEnabled       bool                 `json:"jiggler_enabled"`
+	JigglerConfig        *JigglerConfig       `json:"jiggler_config"`
+	AutoUpdateEnabled    bool                 `json:"auto_update_enabled"`
+	IncludePreRelease    bool                 `json:"include_pre_release"`
+	HashedPassword       string               `json:"hashed_password"`
+	LocalAuthToken       string               `json:"local_auth_token"`
+	LocalAuthMode        string               `json:"localAuthMode"` //TODO: fix it with migration
+	LocalLoopbackOnly    bool                 `json:"local_loopback_only"`
+	WakeOnLanDevices     []WakeOnLanDevice    `json:"wake_on_lan_devices"`
+	KeyboardMacros       []KeyboardMacro      `json:"keyboard_macros"`
+	KeyboardLayout       string               `json:"keyboard_layout"`
+	EdidString           string               `json:"hdmi_edid_string"`
+	ActiveExtension      string               `json:"active_extension"`
+	DisplayRotation      string               `json:"display_rotation"`
+	DisplayMaxBrightness int                  `json:"display_max_brightness"`
+	DisplayDimAfterSec   int                  `json:"display_dim_after_sec"`
+	DisplayOffAfterSec   int                  `json:"display_off_after_sec"`
+	TLSMode              string               `json:"tls_mode"` // options: "self-signed", "user-defined", ""
+	UsbConfig            *usbgadget.Config    `json:"usb_config"`
+	UsbDevices           *usbgadget.Devices   `json:"usb_devices"`
+	NetworkConfig        *types.NetworkConfig `json:"network_config"`
+	DefaultLogLevel      string               `json:"default_log_level"`
+	VideoSleepAfterSec   int                  `json:"video_sleep_after_sec"`
+	VideoQualityFactor   float64              `json:"video_quality_factor"`
+	VideoCodecPreference string               `json:"video_codec_preference"`
+	HideDisplayWhenIdle  bool                 `json:"host_display_disable_when_idle"`
+	NativeMaxRestart     uint                 `json:"native_max_restart_attempts"`
+	MqttConfig           *MQTTConfig          `json:"mqtt_config"`
+	AudioEnabled         bool                 `json:"audio_enabled"`
+}
+
+// GetUpdateAPIURL returns the update API URL
+func (c *Config) GetUpdateAPIURL() string {
+	if c.UpdateAPIURL == "" {
+		return DefaultAPIURL
+	}
+	return strings.TrimSuffix(c.UpdateAPIURL, "/") + "/releases"
+}
+
+// GetDisplayRotation returns the display rotation
+func (c *Config) GetDisplayRotation() uint16 {
+	rotationInt, err := strconv.ParseUint(c.DisplayRotation, 10, 16)
+	if err != nil {
+		logger.Warn().Err(err).Msg("invalid display rotation, using default")
+		return 270
+	}
+	return uint16(rotationInt)
+}
+
+// SetDisplayRotation sets the display rotation
+func (c *Config) SetDisplayRotation(rotation string) error {
+	_, err := strconv.ParseUint(rotation, 10, 16)
+	if err != nil {
+		logger.Warn().Err(err).Msg("invalid display rotation, using default")
+		return err
+	}
+	c.DisplayRotation = rotation
+	return nil
 }
 
 const configPath = "/userdata/kvm_config.json"
 
-var defaultConfig = &Config{
-	CloudURL:             "https://api.jetkvm.com",
-	CloudAppURL:          "https://app.jetkvm.com",
-	AutoUpdateEnabled:    true, // Set a default value
-	ActiveExtension:      "",
-	KeyboardMacros:       []KeyboardMacro{},
-	DisplayRotation:      "270",
-	KeyboardLayout:       "en-US",
-	DisplayMaxBrightness: 64,
-	DisplayDimAfterSec:   120,  // 2 minutes
-	DisplayOffAfterSec:   1800, // 30 minutes
-	JigglerEnabled:       false,
-	// This is the "Standard" jiggler option in the UI
-	JigglerConfig: &JigglerConfig{
+// it's a temporary solution to avoid sharing the same pointer
+// we should migrate to a proper config solution in the future
+var (
+	defaultJigglerConfig = JigglerConfig{
 		InactivityLimitSeconds: 60,
 		JitterPercentage:       25,
 		ScheduleCronTab:        "0 * * * * *",
 		Timezone:               "UTC",
-	},
-	TLSMode: "",
-	UsbConfig: &usbgadget.Config{
+	}
+	defaultUsbConfig = usbgadget.Config{
 		VendorId:     "0x1d6b", //The Linux Foundation
 		ProductId:    "0x0104", //Multifunction Composite Gadget
 		SerialNumber: "",
 		Manufacturer: "JetKVM",
 		Product:      "USB Emulation Device",
-	},
-	UsbDevices: &usbgadget.Devices{
+	}
+	defaultUsbDevices = usbgadget.Devices{
 		AbsoluteMouse: true,
 		RelativeMouse: true,
 		Keyboard:      true,
 		MassStorage:   true,
-	},
-	NetworkConfig:   &network.NetworkConfig{},
-	DefaultLogLevel: "INFO",
+		Audio:         true,
+	}
+)
+
+func getDefaultConfig() Config {
+	return Config{
+		CloudURL:             DefaultAPIURL,
+		UpdateAPIURL:         DefaultAPIURL,
+		CloudAppURL:          "https://app.jetkvm.com",
+		AutoUpdateEnabled:    true, // Set a default value
+		ActiveExtension:      "",
+		KeyboardMacros:       []KeyboardMacro{},
+		DisplayRotation:      "270",
+		KeyboardLayout:       "en-US",
+		DisplayMaxBrightness: 64,
+		DisplayDimAfterSec:   120,  // 2 minutes
+		DisplayOffAfterSec:   1800, // 30 minutes
+		JigglerEnabled:       false,
+		// This is the "Standard" jiggler option in the UI
+		JigglerConfig: func() *JigglerConfig { c := defaultJigglerConfig; return &c }(),
+		TLSMode:       "",
+		UsbConfig:     func() *usbgadget.Config { c := defaultUsbConfig; return &c }(),
+		UsbDevices:    func() *usbgadget.Devices { c := defaultUsbDevices; return &c }(),
+		NetworkConfig: func() *types.NetworkConfig {
+			c := &types.NetworkConfig{}
+			_ = confparser.SetDefaultsAndValidate(c)
+			return c
+		}(),
+		DefaultLogLevel:      "WARN",
+		VideoQualityFactor:   1.0,
+		VideoCodecPreference: "auto",
+		MqttConfig: &MQTTConfig{
+			Enabled:           false,
+			Port:              1883,
+			BaseTopic:         "jetkvm",
+			EnableHADiscovery: false,
+			EnableActions:     true,
+			DebounceMs:        500,
+		},
+	}
 }
 
 var (
@@ -174,7 +249,8 @@ func LoadConfig() {
 	}
 
 	// load the default config
-	config = defaultConfig
+	defaultConfig := getDefaultConfig()
+	config = &defaultConfig
 
 	file, err := os.Open(configPath)
 	if err != nil {
@@ -186,8 +262,15 @@ func LoadConfig() {
 	defer file.Close()
 
 	// load and merge the default config with the user config
-	loadedConfig := *defaultConfig
-	if err := json.NewDecoder(file).Decode(&loadedConfig); err != nil {
+	rawConfig, err := io.ReadAll(file)
+	if err != nil {
+		logger.Warn().Err(err).Msg("config file reading failed")
+		configSuccess.Set(0.0)
+		return
+	}
+
+	loadedConfig := defaultConfig
+	if err := json.Unmarshal(rawConfig, &loadedConfig); err != nil {
 		logger.Warn().Err(err).Msg("config file JSON parsing failed")
 		configSuccess.Set(0.0)
 		return
@@ -195,24 +278,53 @@ func LoadConfig() {
 
 	// merge the user config with the default config
 	if loadedConfig.UsbConfig == nil {
-		loadedConfig.UsbConfig = defaultConfig.UsbConfig
+		loadedConfig.UsbConfig = getDefaultConfig().UsbConfig
 	}
 
 	if loadedConfig.UsbDevices == nil {
-		loadedConfig.UsbDevices = defaultConfig.UsbDevices
+		loadedConfig.UsbDevices = getDefaultConfig().UsbDevices
+	} else if !usbDevicesConfigHasAudio(rawConfig) {
+		loadedConfig.UsbDevices.Audio = defaultUsbDevices.Audio
+	}
+
+	if !loadedConfig.UsbDevices.Audio {
+		loadedConfig.AudioEnabled = false
 	}
 
 	if loadedConfig.NetworkConfig == nil {
-		loadedConfig.NetworkConfig = defaultConfig.NetworkConfig
+		loadedConfig.NetworkConfig = getDefaultConfig().NetworkConfig
 	}
 
 	if loadedConfig.JigglerConfig == nil {
-		loadedConfig.JigglerConfig = defaultConfig.JigglerConfig
+		loadedConfig.JigglerConfig = getDefaultConfig().JigglerConfig
+	}
+
+	if loadedConfig.MqttConfig == nil {
+		loadedConfig.MqttConfig = getDefaultConfig().MqttConfig
 	}
 
 	// fixup old keyboard layout value
 	if loadedConfig.KeyboardLayout == "en_US" {
 		loadedConfig.KeyboardLayout = "en-US"
+	}
+
+	// Until rolling logs land, do not persist verbose levels across reboots.
+	loadedConfig.DefaultLogLevel = "WARN"
+
+	// Migrate prior JetKVM defaults to the current native.DefaultEDID:
+	//   - Toshiba TSB chip default (pre-JetKVM-v1 EDID, no CEA extension)
+	//   - JetKVM v1 EDID without the 1280x720@120 DTD (the previous default that
+	//     advertised only 1080p60 + 720p60 in the base block)
+	//   - JetKVM v1 EDID with 720p120 in CTA extension only (NVIDIA didn't pick
+	//     it up; superseded by base-block DTD1 = 720p120)
+	const tsbDefaultEDID = "00ffffffffffff0052620188008888881c150103800000780a0dc9a05747982712484c00000001010101010101010101010101010101023a801871382d40582c4500c48e2100001e011d007251d01e206e285500c48e2100001e000000fc00543734392d6648443732300a20000000fd00147801ff1d000a202020202020017b"
+	const jkvV1NoHighRefresh = "00ffffffffffff0028b4010001eeffc0302301038047287856ee91a3544c99260f5054000000d1c081c0318001010101010101010101023a801871382d40582c4500c48e2100001e011d007251d01e206e285500c48e2100001e000000fd00174c0f5111000a202020202020000000fc004a65744b564d2076310a202020011d020322d1431004012309070783010000e200cfe40d100401e305000065030c001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000cf"
+	const jkvV1CtaOnly120 = "00ffffffffffff0028b4010001eeffc0302301038047287856ee91a3544c99260f5054000000d1c081c0318001010101010101010101023a801871382d40582c4500c48e2100001e011d007251d01e206e285500c48e2100001e000000fd00174c0f5111000a202020202020000000fc004a65744b564d2076310a202020011d020322d1431004012309070783010000e200cfe40d100401e305000065030c001000773300a050d02b2030203500122c2100001a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001c"
+	if loadedConfig.EdidString == "" ||
+		strings.EqualFold(loadedConfig.EdidString, tsbDefaultEDID) ||
+		strings.EqualFold(loadedConfig.EdidString, jkvV1NoHighRefresh) ||
+		strings.EqualFold(loadedConfig.EdidString, jkvV1CtaOnly120) {
+		loadedConfig.EdidString = native.DefaultEDID
 	}
 
 	config = &loadedConfig
@@ -225,18 +337,39 @@ func LoadConfig() {
 	logger.Info().Str("path", configPath).Msg("config loaded")
 }
 
+func usbDevicesConfigHasAudio(rawConfig []byte) bool {
+	var payload struct {
+		UsbDevices map[string]json.RawMessage `json:"usb_devices"`
+	}
+
+	if err := json.Unmarshal(rawConfig, &payload); err != nil || payload.UsbDevices == nil {
+		return true
+	}
+
+	_, ok := payload.UsbDevices["audio"]
+	return ok
+}
+
 func SaveConfig() error {
+	return saveConfig(configPath)
+}
+
+func SaveBackupConfig() error {
+	return saveConfig(configPath + ".bak")
+}
+
+func saveConfig(path string) error {
 	configLock.Lock()
 	defer configLock.Unlock()
 
-	logger.Trace().Str("path", configPath).Msg("Saving config")
+	logger.Trace().Str("path", path).Msg("Saving config")
 
 	// fixup old keyboard layout value
 	if config.KeyboardLayout == "en_US" {
 		config.KeyboardLayout = "en-US"
 	}
 
-	file, err := os.Create(configPath)
+	file, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("failed to create config file: %w", err)
 	}
@@ -252,7 +385,7 @@ func SaveConfig() error {
 		return fmt.Errorf("failed to wite config: %w", err)
 	}
 
-	logger.Info().Str("path", configPath).Msg("config saved")
+	logger.Info().Str("path", path).Msg("config saved")
 	return nil
 }
 
