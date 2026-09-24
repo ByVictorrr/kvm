@@ -31,7 +31,7 @@ interface EKLKVMSwitchProps {
 export function EKLKVMSwitch({ compact = false }: EKLKVMSwitchProps) {
   const [activeInput, setActiveInput] = useState<number | null>(null);
   const [pendingInput, setPendingInput] = useState<number | null>(null);
-  const { reportKeypressEvent, rpcHidReady } = useHidRpc();
+  const { reportKeypressEvent } = useHidRpc();
 
   const handleSwitch = async (input: number) => {
     if (pendingInput !== null) return;
@@ -39,32 +39,23 @@ export function EKLKVMSwitch({ compact = false }: EKLKVMSwitchProps) {
 
     try {
       const portKey = DIGIT_KEYS[input - 1];
-      console.log(`[EKL] switching to input ${input} | rpcHidReady=${rpcHidReady} | portKey=0x${portKey.toString(16)}`);
 
       // ScrollLock #1
-      console.log("[EKL] ScrollLock press 1");
       reportKeypressEvent(SCROLL_LOCK, true);
       await sleep(50);
       reportKeypressEvent(SCROLL_LOCK, false);
       await sleep(80);
 
-      // ScrollLock #2 — KVM should enter control state and beep twice
-      console.log("[EKL] ScrollLock press 2");
+      // ScrollLock #2 — KVM enters control state
       reportKeypressEvent(SCROLL_LOCK, true);
       await sleep(50);
       reportKeypressEvent(SCROLL_LOCK, false);
       await sleep(300); // give KVM time to enter control mode
 
       // Port digit
-      console.log(`[EKL] Digit${input} press`);
       reportKeypressEvent(portKey, true);
       await sleep(50);
       reportKeypressEvent(portKey, false);
-
-      console.log("[EKL] sequence complete");
-
-      // Also fire serial API — no-op until RS-232 hardware is wired
-      fetch(`/api/ekl/input/${input}`, { method: "POST" }).catch(() => {});
 
       setActiveInput(input);
     } catch (err) {
